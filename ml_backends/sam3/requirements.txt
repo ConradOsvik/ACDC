@@ -1,0 +1,10 @@
+label-studio-ml==1.0.9
+redis
+rq
+label-studio-tools
+label-studio-converter
+transformers
+torch
+torchvision
+Pillow
+numpy
