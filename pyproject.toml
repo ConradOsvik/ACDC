@@ -5,11 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "label-studio-converter>=0.0.59",
-    "label-studio-ml>=1.0.9",
-    "numpy>=2.4.2",
-    "pillow>=12.1.1",
-    "torch>=2.10.0",
-    "torchvision>=0.25.0",
-    "transformers>=5.2.0",
+    "label-studio-sdk>=2.0.17",
+    "python-dotenv>=1.2.2",
 ]
