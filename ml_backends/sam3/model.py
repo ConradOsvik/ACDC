@@ -2,9 +2,11 @@ import io
 import os
 import tempfile
 import uuid
+import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 from label_studio_ml.model import LabelStudioMLBase
+from label_studio_converter.brush import mask2rle
 from ultralytics.models.sam import SAM3SemanticPredictor
 
 LS_URL = os.environ.get('LABEL_STUDIO_URL', 'http://localhost:8080')
@@ -27,6 +29,17 @@ def get_ls_session():
     return session
 
 
+def polygons_to_mask(polygons_xy, height, width) -> np.ndarray:
+    """Draw multiple polygon contours onto a single binary mask (union)."""
+    mask_img = Image.new('L', (width, height), 0)
+    draw = ImageDraw.Draw(mask_img)
+    for polygon_xy in polygons_xy:
+        if len(polygon_xy) < 3:
+            continue
+        draw.polygon([(float(x), float(y)) for x, y in polygon_xy], fill=255)
+    return np.array(mask_img)  # 0 or 255, uint8 — mask2rle thresholds at 128
+
+
 class SAM3Backend(LabelStudioMLBase):
     def __init__(self, project_id=None, **kwargs):
         super().__init__(**kwargs)
@@ -42,10 +55,10 @@ class SAM3Backend(LabelStudioMLBase):
         self.predictor = SAM3SemanticPredictor(overrides=overrides)
 
     def _get_label_config(self):
-        from_name, to_name, labels = 'label', 'image', []
+        from_name, to_name, labels = 'brush_label', 'image', []
         if self.parsed_label_config:
             for tag_name, tag_info in self.parsed_label_config.items():
-                if tag_info.get('type', '').lower().endswith('labels'):
+                if tag_info.get('type', '').lower() == 'brushlabels':
                     from_name = tag_name
                     to_name = tag_info.get('to_name', ['image'])[0]
                     labels = tag_info.get('labels', [])
@@ -58,19 +71,16 @@ class SAM3Backend(LabelStudioMLBase):
         predictions = []
 
         for task in tasks:
-            # Fetch image from Label Studio
             image_url = task['data']['image']
             if not image_url.startswith('http'):
                 image_url = f"{LS_URL}{image_url}"
-            print(f"[SAM3] Fetching image: {image_url}")
+            print(f"[SAM3] Fetching: {image_url}")
             session = get_ls_session()
             resp = session.get(image_url, timeout=30)
             resp.raise_for_status()
             image = Image.open(io.BytesIO(resp.content)).convert("RGB")
             width, height = image.size
-            print(f"[SAM3] Image size: {width}x{height}")
 
-            # Save to temp file — same as run_ultralytics.py uses a file path
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
                 tmp_path = tmp.name
                 image.save(tmp_path)
@@ -96,51 +106,48 @@ class SAM3Backend(LabelStudioMLBase):
                     label_name = labels[0] if labels else "Object"
                     print(f"[SAM3] Interactive box mode, label: {label_name}")
                     results = self.predictor(bboxes=[input_box])
-                    print(f"[SAM3] Raw results: {results}")
                     if results and results[0].masks is not None:
-                        print(f"[SAM3] Masks count: {len(results[0].masks.xy)}")
-                        result_list.extend(
-                            self._masks_to_polygons(results[0].masks.xy, width, height, label_name, from_name, to_name)
+                        polygons = results[0].masks.xy
+                        print(f"[SAM3] {len(polygons)} masks → merging into 1 brush region")
+                        result_list.append(
+                            self._polygons_to_brush_result(polygons, height, width, label_name, from_name, to_name)
                         )
                 else:
                     query_labels = labels if labels else ["object"]
                     print(f"[SAM3] Text mode, querying: {query_labels}")
                     for label_name in query_labels:
                         results = self.predictor(text=[label_name.lower()])
-                        print(f"[SAM3] '{label_name}' raw results: {results}")
                         if results and results[0].masks is not None:
-                            n = len(results[0].masks.xy)
-                            print(f"[SAM3] '{label_name}': {n} masks")
-                            result_list.extend(
-                                self._masks_to_polygons(results[0].masks.xy, width, height, label_name, from_name, to_name)
+                            polygons = results[0].masks.xy
+                            print(f"[SAM3] '{label_name}': {len(polygons)} masks → 1 brush region")
+                            result_list.append(
+                                self._polygons_to_brush_result(polygons, height, width, label_name, from_name, to_name)
                             )
                         else:
-                            print(f"[SAM3] '{label_name}': no masks returned")
+                            print(f"[SAM3] '{label_name}': no masks")
             finally:
                 os.unlink(tmp_path)
 
-            print(f"[SAM3] Returning {len(result_list)} polygons")
+            print(f"[SAM3] Returning {len(result_list)} brush regions")
             predictions.append({"result": result_list})
 
         return predictions
 
-    def _masks_to_polygons(self, masks_xy, width, height, label_name, from_name, to_name):
-        result_list = []
-        for polygon_xy in masks_xy:
-            if len(polygon_xy) < 3:
-                continue
-            points = [
-                [float(x) / width * 100, float(y) / height * 100]
-                for x, y in polygon_xy
-            ]
-            result_list.append({
-                "id": uuid.uuid4().hex[:8],
-                "from_name": from_name,
-                "to_name": to_name,
-                "type": "polygonlabels",
-                "value": {
-                    "points": points,
-                    "polygonlabels": [label_name],
-                }
-            })
-        return result_list
+    def _polygons_to_brush_result(self, polygons_xy, height, width, label_name, from_name, to_name):
+        """Merge all polygons for a label into a single filled brush (RLE) region."""
+        mask_np = polygons_to_mask(polygons_xy, height, width)  # 0 or 255, uint8
+        rle = mask2rle(mask_np)
+        return {
+            "id": uuid.uuid4().hex[:8],
+            "from_name": from_name,
+            "to_name": to_name,
+            "type": "brushlabels",
+            "original_width": width,
+            "original_height": height,
+            "image_rotation": 0,
+            "value": {
+                "format": "rle",
+                "rle": rle,
+                "brushlabels": [label_name],
+            }
+        }
