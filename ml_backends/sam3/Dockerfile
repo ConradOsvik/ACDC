@@ -1,12 +1,17 @@
-FROM python:3.12-slim
+FROM ultralytics/ultralytics:latest
 
 WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir \
+    label-studio-ml redis rq requests \
+    timm huggingface-hub safetensors \
+    git+https://github.com/ultralytics/CLIP.git
 
-COPY model.py _wsgi.py ./
+COPY model.py .
+
+RUN label-studio-ml init sam3-backend --script model.py
 
 EXPOSE 9090
 
-ENTRYPOINT ["label-studio-ml", "start", "./", "--port", "9090"]
+CMD ["label-studio-ml", "start", "sam3-backend", "--host", "0.0.0.0", "--port", "9090"]
