@@ -36,13 +36,17 @@ LABEL_CONFIG = """<View>
   <Image name="image" value="$image" zoom="true"/>
 
   <BrushLabels name="brush_label" toName="image">
-    <Label value="red rust" background="#D4380D"/>
-    <Label value="white rust" background="#8C8C8C"/>
+    <Label value="Red Rust"    background="#FF6B00"/>
+    <Label value="White Rust"  background="#00AAFF"/>
+    <Label value="Blistering"  background="#FF0000"/>
+    <Label value="Flaking"     background="#FFD700"/>
   </BrushLabels>
 
   <RectangleLabels name="bbox" toName="image" smart="true" showInline="true">
-    <Label value="red rust" background="#D4380D"/>
-    <Label value="white rust" background="#8C8C8C"/>
+    <Label value="Red Rust"    background="#8B2500"/>
+    <Label value="White Rust"  background="#005580"/>
+    <Label value="Blistering"  background="#7B0000"/>
+    <Label value="Flaking"     background="#8B7000"/>
   </RectangleLabels>
 </View>"""
 
