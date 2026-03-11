@@ -3,6 +3,13 @@ services:
   yolo-seg:
     build: ../../ml_backends/yolo
     container_name: yolo-seg
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     environment:
       - LABEL_STUDIO_URL=http://label-studio:8080
       - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
@@ -17,6 +24,13 @@ services:
 
   sam3:
     build: ../../ml_backends/sam3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     container_name: sam3
     mem_limit: 8g
     environment:
