@@ -6,9 +6,9 @@ services:
             resources:
                 reservations:
                     devices:
-                    - driver: nvidia
-                    count: 1
-                    capabilities: [gpu]
+                        - driver: nvidia
+                          count: 1
+                          capabilities: [gpu]
         restart: unless-stopped
         environment:
             - LABEL_STUDIO_URL=${LABEL_STUDIO_EXTERNAL_URL}
@@ -27,9 +27,9 @@ services:
             resources:
                 reservations:
                     devices:
-                    - driver: nvidia
-                    count: 1
-                    capabilities: [gpu]
+                        - driver: nvidia
+                          count: 1
+                          capabilities: [gpu]
         restart: unless-stopped
         mem_limit: 8g
         environment:

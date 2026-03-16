@@ -73,6 +73,7 @@ services:
 
 networks:
     ls-net:
+        name: ls-net
 
 volumes:
     postgres-data:
