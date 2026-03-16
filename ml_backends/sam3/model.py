@@ -1,216 +1,153 @@
-"""
-SAM 3 Label Studio ML Backend
-
-A custom Label Studio ML backend that loads SAM 3 from HuggingFace.
-Serves as an extensible template for adding future HuggingFace models.
-
-Supports two modes:
-- Batch pre-annotation: uses label names as text prompts for concept segmentation
-- Interactive mode: processes keypoint clicks and bounding box prompts via text
-
-Configure the model via the SAM3_MODEL_NAME environment variable.
-"""
-
+import io
 import os
-import logging
-from uuid import uuid4
-
+import tempfile
+import uuid
 import numpy as np
-import torch
-from PIL import Image
-from transformers import Sam3Processor, Sam3Model
-
+import requests
+from PIL import Image, ImageDraw
 from label_studio_ml.model import LabelStudioMLBase
-from label_studio_converter import brush
+from label_studio_converter.brush import mask2rle
+from ultralytics.models.sam import SAM3SemanticPredictor
 
-logger = logging.getLogger(__name__)
+LS_URL = os.environ.get('LABEL_STUDIO_URL', 'http://localhost:8080')
+LS_API_KEY = os.environ.get('LABEL_STUDIO_API_KEY', '')
+MODEL_PATH = os.environ.get('SAM3_MODEL_PATH', 'sam3.pt')
 
-SAM3_MODEL_NAME = os.environ.get("SAM3_MODEL_NAME", "facebook/sam3")
+
+def get_ls_session():
+    session = requests.Session()
+    resp = session.post(
+        f"{LS_URL}/api/token/refresh/",
+        json={"refresh": LS_API_KEY},
+        timeout=10,
+    )
+    if resp.ok:
+        access_token = resp.json().get("access")
+        session.headers["Authorization"] = f"Bearer {access_token}"
+    else:
+        session.headers["Authorization"] = f"Token {LS_API_KEY}"
+    return session
 
 
-class Sam3Backend(LabelStudioMLBase):
+def polygons_to_mask(polygons_xy, height, width) -> np.ndarray:
+    """Draw multiple polygon contours onto a single binary mask (union)."""
+    mask_img = Image.new('L', (width, height), 0)
+    draw = ImageDraw.Draw(mask_img)
+    for polygon_xy in polygons_xy:
+        if len(polygon_xy) < 3:
+            continue
+        draw.polygon([(float(x), float(y)) for x, y in polygon_xy], fill=255)
+    return np.array(mask_img)  # 0 or 255, uint8 — mask2rle thresholds at 128
 
-    def setup(self):
-        """Load the SAM 3 model and processor from HuggingFace."""
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Loading model {SAM3_MODEL_NAME} on {self.device}")
 
-        self.processor = Sam3Processor.from_pretrained(SAM3_MODEL_NAME)
-        self.model = Sam3Model.from_pretrained(SAM3_MODEL_NAME).to(self.device)
-        self.model.eval()
-
-        self.set("model_version", f"sam3-{SAM3_MODEL_NAME.split('/')[-1]}")
-        logger.info("Model loaded successfully")
-
-    def predict(self, tasks, context=None, **kwargs):
-        """Generate mask predictions for the given tasks.
-
-        Batch mode: uses label names from labeling config as text prompts.
-        Interactive mode: extracts the label from clicks/boxes and uses it
-        as a text prompt.
-        """
-        results = []
-        for task in tasks:
-            image = self._load_image(task)
-            width, height = image.size
-            from_name, to_name, labels = self._get_label_config()
-
-            if context and context.get("result"):
-                predictions = self._predict_interactive(
-                    image, context, from_name, to_name, width, height
-                )
-            else:
-                predictions = self._predict_batch(
-                    image, from_name, to_name, labels, width, height
-                )
-
-            results.append(predictions)
-        return results
-
-    def _load_image(self, task):
-        """Load an image from a task, resolving Label Studio URLs."""
-        image_url = task["data"].get(
-            self._get_image_value_key(), list(task["data"].values())[0]
+class SAM3Backend(LabelStudioMLBase):
+    def __init__(self, project_id=None, **kwargs):
+        super().__init__(**kwargs)
+        overrides = dict(
+            conf=0.25,
+            task="segment",
+            mode="predict",
+            model=MODEL_PATH,
+            save=False,
+            verbose=False,
         )
-        local_path = self.get_local_path(image_url, task_id=task.get("id"))
-        return Image.open(local_path).convert("RGB")
-
-    def _get_image_value_key(self):
-        """Extract the image data key from the labeling config."""
-        for _, tag_info in self.parsed_label_config.items():
-            if tag_info.get("type") == "Image":
-                return tag_info.get("value", "image")
-            for inp in tag_info.get("inputs", []):
-                if inp.get("type") == "Image":
-                    return inp.get("value", "image")
-        return "image"
+        print(f"Loading SAM 3 model from {MODEL_PATH}...")
+        self.predictor = SAM3SemanticPredictor(overrides=overrides)
 
     def _get_label_config(self):
-        """Extract BrushLabels tag info and all label names from the config."""
-        from_name, to_name, _ = self.get_first_tag_occurence(
-            "BrushLabels", "Image"
-        )
-        labels = []
-        for _, tag_info in self.parsed_label_config.items():
-            if tag_info.get("type") == "BrushLabels":
-                labels = tag_info.get("labels", [])
-                break
-        if not labels:
-            labels = ["Object"]
+        from_name, to_name, labels = 'brush_label', 'image', []
+        if self.parsed_label_config:
+            for tag_name, tag_info in self.parsed_label_config.items():
+                if tag_info.get('type', '').lower() == 'brushlabels':
+                    from_name = tag_name
+                    to_name = tag_info.get('to_name', ['image'])[0]
+                    labels = tag_info.get('labels', [])
+                    break
+        print(f"[SAM3] from_name={from_name}, labels={labels}")
         return from_name, to_name, labels
 
-    def _segment_with_text(self, image, text, width, height, threshold=0.5):
-        """Run SAM 3 text-prompted segmentation and return masks + scores."""
-        inputs = self.processor(
-            images=image, text=text, return_tensors="pt"
-        ).to(self.device)
+    def predict(self, tasks, context=None, **kwargs):
+        from_name, to_name, labels = self._get_label_config()
+        predictions = []
 
-        with torch.no_grad():
-            outputs = self.model(**inputs)
+        for task in tasks:
+            image_url = task['data']['image']
+            if not image_url.startswith('http'):
+                image_url = f"{LS_URL}{image_url}"
+            print(f"[SAM3] Fetching: {image_url}")
+            session = get_ls_session()
+            resp = session.get(image_url, timeout=30)
+            resp.raise_for_status()
+            image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            width, height = image.size
 
-        results = self.processor.post_process_instance_segmentation(
-            outputs,
-            threshold=threshold,
-            mask_threshold=0.5,
-            target_sizes=inputs.get("original_sizes").tolist(),
-        )[0]
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                tmp_path = tmp.name
+                image.save(tmp_path)
 
-        masks = [m.cpu().numpy() for m in results["masks"]]
-        scores = [float(s) for s in results["scores"]]
-        return masks, scores
+            try:
+                self.predictor.set_image(tmp_path)
+                result_list = []
 
-    def _predict_batch(self, image, from_name, to_name, labels, width, height):
-        """Use each label name as a text prompt to find all instances."""
-        all_results = []
-        total_score = 0.0
-        count = 0
+                # Interactive bbox mode
+                input_box = None
+                if context and context.get('result'):
+                    for item in context['result']:
+                        if item['type'] == 'rectanglelabels':
+                            v = item['value']
+                            x1 = v['x'] * width / 100.0
+                            y1 = v['y'] * height / 100.0
+                            x2 = (v['x'] + v['width']) * width / 100.0
+                            y2 = (v['y'] + v['height']) * height / 100.0
+                            input_box = [x1, y1, x2, y2]
+                            break
 
-        for label in labels:
-            masks, scores = self._segment_with_text(
-                image, label, width, height
-            )
-            for mask, score in zip(masks, scores):
-                mask_uint8 = (mask > 0).astype(np.uint8) * 255
-                rle = brush.mask2rle(mask_uint8)
-                all_results.append({
-                    "id": str(uuid4())[:4],
-                    "from_name": from_name,
-                    "to_name": to_name,
-                    "original_width": width,
-                    "original_height": height,
-                    "image_rotation": 0,
-                    "value": {
-                        "format": "rle",
-                        "rle": rle,
-                        "brushlabels": [label],
-                    },
-                    "score": score,
-                    "type": "brushlabels",
-                    "readonly": False,
-                })
-                total_score += score
-                count += 1
+                if input_box:
+                    label_name = labels[0] if labels else "Object"
+                    print(f"[SAM3] Interactive box mode, label: {label_name}")
+                    results = self.predictor(bboxes=[input_box])
+                    if results and results[0].masks is not None:
+                        polygons = results[0].masks.xy
+                        print(f"[SAM3] {len(polygons)} masks → merging into 1 brush region")
+                        result_list.append(
+                            self._polygons_to_brush_result(polygons, height, width, label_name, from_name, to_name)
+                        )
+                else:
+                    query_labels = labels if labels else ["object"]
+                    print(f"[SAM3] Text mode, querying: {query_labels}")
+                    for label_name in query_labels:
+                        results = self.predictor(text=[label_name.lower()])
+                        if results and results[0].masks is not None:
+                            polygons = results[0].masks.xy
+                            print(f"[SAM3] '{label_name}': {len(polygons)} masks → 1 brush region")
+                            result_list.append(
+                                self._polygons_to_brush_result(polygons, height, width, label_name, from_name, to_name)
+                            )
+                        else:
+                            print(f"[SAM3] '{label_name}': no masks")
+            finally:
+                os.unlink(tmp_path)
 
+            print(f"[SAM3] Returning {len(result_list)} brush regions")
+            predictions.append({"result": result_list})
+
+        return predictions
+
+    def _polygons_to_brush_result(self, polygons_xy, height, width, label_name, from_name, to_name):
+        """Merge all polygons for a label into a single filled brush (RLE) region."""
+        mask_np = polygons_to_mask(polygons_xy, height, width)  # 0 or 255, uint8
+        rle = mask2rle(mask_np)
         return {
-            "result": all_results,
-            "model_version": self.get("model_version"),
-            "score": total_score / max(count, 1),
-        }
-
-    def _predict_interactive(self, image, context, from_name, to_name, width, height):
-        """Process interactive prompts by extracting the label as a text prompt."""
-        label = None
-
-        for result in context["result"]:
-            value = result.get("value", {})
-            result_type = result.get("type")
-
-            if result_type == "keypointlabels":
-                labels = value.get("keypointlabels", [])
-                if labels:
-                    label = labels[0]
-            elif result_type == "rectanglelabels":
-                labels = value.get("rectanglelabels", [])
-                if labels:
-                    label = labels[0]
-
-            if label:
-                break
-
-        if not label:
-            label = "Object"
-
-        masks, scores = self._segment_with_text(image, label, width, height)
-
-        if not masks:
-            return {"result": [], "model_version": self.get("model_version")}
-
-        all_results = []
-        total_score = 0.0
-
-        for mask, score in zip(masks, scores):
-            mask_uint8 = (mask > 0).astype(np.uint8) * 255
-            rle = brush.mask2rle(mask_uint8)
-            all_results.append({
-                "id": str(uuid4())[:4],
-                "from_name": from_name,
-                "to_name": to_name,
-                "original_width": width,
-                "original_height": height,
-                "image_rotation": 0,
-                "value": {
-                    "format": "rle",
-                    "rle": rle,
-                    "brushlabels": [label],
-                },
-                "score": score,
-                "type": "brushlabels",
-                "readonly": False,
-            })
-            total_score += score
-
-        return {
-            "result": all_results,
-            "model_version": self.get("model_version"),
-            "score": total_score / max(len(all_results), 1),
+            "id": uuid.uuid4().hex[:8],
+            "from_name": from_name,
+            "to_name": to_name,
+            "type": "brushlabels",
+            "original_width": width,
+            "original_height": height,
+            "image_rotation": 0,
+            "value": {
+                "format": "rle",
+                "rle": rle,
+                "brushlabels": [label_name],
+            }
         }

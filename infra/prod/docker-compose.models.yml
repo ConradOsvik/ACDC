@@ -1,0 +1,33 @@
+services:
+    yolo-seg:
+        build: ../../ml_backends/yolo
+        container_name: yolo-seg
+        restart: unless-stopped
+        environment:
+            - LABEL_STUDIO_URL=${LABEL_STUDIO_EXTERNAL_URL}
+            - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
+            - YOLO_MODEL_PATH=${YOLO_MODEL_PATH:-yolo11n-seg.pt}
+            - YOLO_CONF=${YOLO_CONF:-0.25}
+        ports:
+            - '9090:9090'
+        volumes:
+            - yolo-data:/data
+
+    sam3:
+        build: ../../ml_backends/sam3
+        container_name: sam3
+        restart: unless-stopped
+        mem_limit: 8g
+        environment:
+            - LABEL_STUDIO_URL=${LABEL_STUDIO_EXTERNAL_URL}
+            - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
+            - SAM3_MODEL_PATH=/models/sam3.pt
+        ports:
+            - '9091:9090'
+        volumes:
+            - ../../ml_backends/sam3/sam3.pt:/models/sam3.pt:ro
+            - sam3-data:/data
+
+volumes:
+    yolo-data:
+    sam3-data:
