@@ -65,7 +65,16 @@ class YOLOSegBackend(LabelStudioMLBase):
 
         for task in tasks:
             image_url = task['data']['image']
-            if not image_url.startswith('http'):
+
+            if image_url.startswith('s3://'):
+                session = get_ls_session()
+                resp = session.get(f"{LS_URL}/api/tasks/{task['id']}/?full=true", timeout=10)
+                resp.raise_for_status()
+                image_url = resp.json()['data']['image']
+                image_url = image_url.replace('http://localhost:8080', LS_URL)
+                print(f"[SAM3] Resolved presigned URL: {image_url}")
+
+            elif not image_url.startswith('http'):
                 image_url = f"{LS_URL}{image_url}"
             session = get_ls_session()
             resp = session.get(image_url, timeout=30)
