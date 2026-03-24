@@ -1,9 +1,8 @@
-import io
 import os
-import tempfile
 import uuid
-import numpy as np
+import tempfile
 import requests
+import numpy as np
 from PIL import Image, ImageDraw
 from label_studio_ml.model import LabelStudioMLBase
 from label_studio_converter.brush import mask2rle
@@ -13,20 +12,46 @@ LS_URL = os.environ.get('LABEL_STUDIO_URL', 'http://localhost:8080')
 LS_API_KEY = os.environ.get('LABEL_STUDIO_API_KEY', '')
 MODEL_PATH = os.environ.get('SAM3_MODEL_PATH', 'sam3.pt')
 
+_access_token_cache = {'token': None}
 
-def get_ls_session():
-    session = requests.Session()
-    resp = session.post(
-        f"{LS_URL}/api/token/refresh/",
-        json={"refresh": LS_API_KEY},
+
+def _get_access_token(force_refresh: bool = False) -> str:
+    if _access_token_cache['token'] and not force_refresh:
+        return _access_token_cache['token']
+    resp = requests.post(
+        f'{LS_URL}/api/token/refresh/',
+        json={'refresh': LS_API_KEY},
         timeout=10,
     )
-    if resp.ok:
-        access_token = resp.json().get("access")
-        session.headers["Authorization"] = f"Bearer {access_token}"
+    resp.raise_for_status()
+    token = resp.json()['access']
+    _access_token_cache['token'] = token
+    return token
+
+
+def _fetch(url: str, **kwargs) -> requests.Response:
+    token = _get_access_token()
+    resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, **kwargs)
+    if resp.status_code == 401:
+        token = _get_access_token(force_refresh=True)
+        resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
+def get_image_path(image_uri: str, task_id: int) -> str:
+    if image_uri.startswith('s3://') or image_uri.startswith('/data/'):
+        presign_url = f'{LS_URL}/tasks/{task_id}/presign/?fileuri={requests.utils.quote(image_uri, safe="")}'
+        resp = _fetch(presign_url, timeout=30, allow_redirects=True)
     else:
-        session.headers["Authorization"] = f"Token {LS_API_KEY}"
-    return session
+        resp = _fetch(image_uri, timeout=30)
+
+    suffix = os.path.splitext(image_uri.split('?')[0])[-1] or '.jpg'
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(resp.content)
+    tmp.close()
+    return tmp.name
+
 
 
 def polygons_to_mask(polygons_xy, height, width) -> np.ndarray:
@@ -71,32 +96,13 @@ class SAM3Backend(LabelStudioMLBase):
         predictions = []
 
         for task in tasks:
-            image_url = task['data']['image']
-
-            if image_url.startswith('s3://'):
-                session = get_ls_session()
-                resp = session.get(f"{LS_URL}/api/tasks/{task['id']}/?full=true", timeout=10)
-                resp.raise_for_status()
-                image_url = resp.json()['data']['image']
-                # Fix localhost → docker service name
-                image_url = image_url.replace('http://localhost:8080', LS_URL)
-                print(f"[SAM3] Resolved presigned URL: {image_url}")
-
-            elif not image_url.startswith('http'):
-                image_url = f"{LS_URL}{image_url}"
-            print(f"[SAM3] Fetching: {image_url}")
-            session = get_ls_session()
-            resp = session.get(image_url, timeout=30)
-            resp.raise_for_status()
-            image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            local_path = get_image_path(task['data']['image'], task_id=task['id'])
+            print(f"[SAM3] Loading: {local_path}")
+            image = Image.open(local_path).convert("RGB")
             width, height = image.size
 
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                tmp_path = tmp.name
-                image.save(tmp_path)
-
             try:
-                self.predictor.set_image(tmp_path)
+                self.predictor.set_image(local_path)
                 result_list = []
 
                 # Interactive bbox mode
@@ -136,7 +142,7 @@ class SAM3Backend(LabelStudioMLBase):
                         else:
                             print(f"[SAM3] '{label_name}': no masks")
             finally:
-                os.unlink(tmp_path)
+                pass
 
             print(f"[SAM3] Returning {len(result_list)} brush regions")
             predictions.append({"result": result_list})
