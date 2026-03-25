@@ -1,6 +1,8 @@
 services:
     yolo-seg:
-        build: ../../ml_backends/yolo
+        build:
+            context: ../../ml_backends
+            dockerfile: yolo/Dockerfile
         container_name: yolo-seg
         deploy:
             resources:
@@ -21,7 +23,9 @@ services:
             - yolo-data:/data
 
     sam3:
-        build: ../../ml_backends/sam3
+        build:
+            context: ../../ml_backends
+            dockerfile: sam3/Dockerfile
         container_name: sam3
         deploy:
             resources:
