@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "label-studio-sdk>=2.0.19",
-    "minio>=7.2.20",
+    "opencv-python-headless>=4.9",
     "python-dotenv>=1.2.2",
 ]
 
