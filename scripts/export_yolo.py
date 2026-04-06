@@ -27,7 +27,7 @@ load_dotenv(Path(__file__).parent / ".env")
 LS_URL = os.environ["LABEL_STUDIO_URL"].rstrip("/")
 REFRESH_TOKEN = os.environ["LABEL_STUDIO_API_KEY"]
 
-_access_token: str | None = None
+_access_token: str = ""
 
 
 def _get_access_token(force_refresh: bool = False) -> str:
