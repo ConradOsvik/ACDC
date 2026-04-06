@@ -8,9 +8,10 @@ RUN pip install --no-cache-dir \
     timm huggingface-hub safetensors \
     git+https://github.com/ultralytics/CLIP.git
 
-COPY model.py .
+COPY utils.py .
+COPY sam3/model.py .
 
-RUN label-studio-ml init sam3-backend --script model.py
+RUN label-studio-ml init sam3-backend --script model.py && cp utils.py sam3-backend/
 
 EXPOSE 9090
 
