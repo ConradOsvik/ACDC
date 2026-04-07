@@ -15,6 +15,8 @@ TRAIN_IMGSZ = int(os.environ.get('YOLO_TRAIN_IMGSZ', '640'))
 
 
 class YOLOSegBackend(LabelStudioMLBase):
+    TRAIN_EVENTS = LabelStudioMLBase.TRAIN_EVENTS + ('START_TRAINING',)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         load_path = str(TRAINED_MODEL_PATH) if TRAINED_MODEL_PATH.exists() else MODEL_PATH
@@ -110,6 +112,7 @@ class YOLOSegBackend(LabelStudioMLBase):
                 task='segment',
                 epochs=TRAIN_EPOCHS,
                 imgsz=TRAIN_IMGSZ,
+                workers=0,
             )
 
             best = Path(results.save_dir) / 'weights' / 'best.pt'

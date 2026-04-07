@@ -62,14 +62,17 @@ def main():
 
     existing = next((p for p in ls.projects.list() if p.title == PROJECT_TITLE), None)
     if existing:
-        print(f"project '{PROJECT_TITLE}' already exists (id={existing.id}), skipping")
-        return
+        print(f"project '{PROJECT_TITLE}' already exists (id={existing.id})")
+        project = existing
+    else:
+        project = ls.projects.create(title=PROJECT_TITLE, label_config=LABEL_CONFIG)
+        print(f"created project '{PROJECT_TITLE}' (id={project.id})")
 
-    project = ls.projects.create(title=PROJECT_TITLE, label_config=LABEL_CONFIG)
-    print(f"created project '{PROJECT_TITLE}' (id={project.id})")
-
-
+    existing_backends = {b.url for b in ls.ml.list(project=project.id)}
     for backend in ML_BACKENDS:
+        if backend["url"] in existing_backends:
+            print(f"backend '{backend['title']}' already connected, skipping")
+            continue
         ls.ml.create(project=project.id, url=backend["url"], title=backend["title"], is_interactive=backend["is_interactive"])
         print(f"connected {backend['title']} at {backend['url']}{' (interactive)' if backend['is_interactive'] else ''}")
 

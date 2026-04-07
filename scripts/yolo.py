@@ -334,10 +334,6 @@ def cmd_train() -> None:
     backend_url = os.environ.get("YOLO_BACKEND_URL", "http://localhost:9090").rstrip("/")
 
     print(f"Triggering training on {backend_url}...")
-    resp = requests.post(f"{backend_url}/train", json={}, timeout=30)
-    resp.raise_for_status()
-
-    print(f"Triggering training on {backend_url}...")
     resp = requests.post(f"{backend_url}/train", json={}, timeout=None)
     resp.raise_for_status()
     print("Training complete.")
