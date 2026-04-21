@@ -143,13 +143,15 @@ def export_annotations_to_yolo(project_id: int, output_dir: Path, split: float =
         for task in split_tasks:
             task_id = task['id']
             annotations = [a for a in task.get('annotations', []) if not a.get('was_cancelled')]
+            if not annotations:
+                skipped += 1
+                continue
+
             brush_results = [
                 r for a in annotations for r in a.get('result', [])
                 if r.get('type') == 'brushlabels'
             ]
-            if not brush_results:
-                skipped += 1
-                continue
+            is_negative = not brush_results  # confirmed empty annotation = background image
 
             stem = f'task_{task_id:06d}'
             yolo_lines: list[str] = []
@@ -173,7 +175,7 @@ def export_annotations_to_yolo(project_id: int, output_dir: Path, split: float =
                     coords = ' '.join(f'{v:.6f}' for v in polygon)
                     yolo_lines.append(f'{class_idx} {coords}')
 
-            if not yolo_lines:
+            if not is_negative and not yolo_lines:
                 skipped += 1
                 continue
 

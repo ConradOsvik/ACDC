@@ -7,9 +7,8 @@ from label_studio_ml.model import LabelStudioMLBase
 from ultralytics import YOLO
 from utils import LS_URL, ls_get, get_image_path, get_brush_label_config, polygons_to_mask, polygons_to_brush_result, export_annotations_to_yolo
 
-MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'yolo26m-seg.pt')
+MODEL_PATH = Path(os.environ.get('YOLO_MODEL_PATH', 'yolo26m-seg.pt'))
 CONF_THRESHOLD = float(os.environ.get('YOLO_CONF', '0.25'))
-TRAINED_MODEL_PATH = Path('/data/trained/best.pt')
 TRAIN_EPOCHS = int(os.environ.get('YOLO_TRAIN_EPOCHS', '50'))
 TRAIN_IMGSZ = int(os.environ.get('YOLO_TRAIN_IMGSZ', '640'))
 
@@ -19,10 +18,9 @@ class YOLOSegBackend(LabelStudioMLBase):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        load_path = str(TRAINED_MODEL_PATH) if TRAINED_MODEL_PATH.exists() else MODEL_PATH
-        print(f"Loading YOLO model from {load_path}...")
+        print(f"Loading YOLO model from {MODEL_PATH}...")
         try:
-            self.model = YOLO(load_path)
+            self.model = YOLO(str(MODEL_PATH))
             print(f"[YOLO] Model loaded successfully")
         except Exception as e:
             print(f"[YOLO] ERROR loading model: {e}")
@@ -33,9 +31,8 @@ class YOLOSegBackend(LabelStudioMLBase):
 
     def _ensure_model_loaded(self):
         if not hasattr(self, 'model') or self.model is None:
-            load_path = str(TRAINED_MODEL_PATH) if TRAINED_MODEL_PATH.exists() else MODEL_PATH
-            print(f"[YOLO] Model not loaded, loading from {load_path}...")
-            self.model = YOLO(load_path)
+            print(f"[YOLO] Model not loaded, loading from {MODEL_PATH}...")
+            self.model = YOLO(str(MODEL_PATH))
 
     def predict(self, tasks, context=None, **kwargs):
         self._ensure_model_loaded()
@@ -102,7 +99,7 @@ class YOLOSegBackend(LabelStudioMLBase):
                 print(f"[YOLO fit] Skipping training: {e}")
                 return {}
 
-            print(f"[YOLO fit] Exported {exported} tasks, skipped {skipped}")
+            print(f"[YOLO fit] Exported {exported} tasks, skipped {skipped} unannotated")
             if exported == 0:
                 print("[YOLO fit] No annotated tasks found, skipping training")
                 return {}
@@ -113,12 +110,13 @@ class YOLOSegBackend(LabelStudioMLBase):
                 epochs=TRAIN_EPOCHS,
                 imgsz=TRAIN_IMGSZ,
                 workers=0,
+                plots=False,
             )
 
             best = Path(results.save_dir) / 'weights' / 'best.pt'
-            TRAINED_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(best, TRAINED_MODEL_PATH)
+            MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(best, MODEL_PATH)
 
-        self.model = YOLO(str(TRAINED_MODEL_PATH))
-        print(f"[YOLO fit] Training complete. Model saved to {TRAINED_MODEL_PATH}")
-        return {'model_path': str(TRAINED_MODEL_PATH)}
+        self.model = YOLO(str(MODEL_PATH))
+        print(f"[YOLO fit] Training complete. Model saved to {MODEL_PATH}")
+        return {'model_path': str(MODEL_PATH)}
