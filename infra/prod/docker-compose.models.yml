@@ -8,8 +8,11 @@ services:
         environment:
             - LABEL_STUDIO_URL=${LABEL_STUDIO_EXTERNAL_URL}
             - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
-            - YOLO_MODEL_PATH=${YOLO_MODEL_PATH:-yolo11n-seg.pt}
+            - YOLO_MODEL_PATH=${YOLO_MODEL_PATH:-yolo26m-seg.pt}
             - YOLO_CONF=${YOLO_CONF:-0.25}
+            - YOLO_TRAIN_EPOCHS=${YOLO_TRAIN_EPOCHS:-50}
+            - YOLO_TRAIN_IMGSZ=${YOLO_TRAIN_IMGSZ:-640}
+            - LABEL_STUDIO_ML_BACKEND_V2=True
         ports:
             - '9090:9090'
         volumes:
