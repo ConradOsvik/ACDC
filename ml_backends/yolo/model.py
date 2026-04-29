@@ -11,6 +11,7 @@ MODEL_PATH = Path(os.environ.get('YOLO_MODEL_PATH', 'yolo26m-seg.pt'))
 CONF_THRESHOLD = float(os.environ.get('YOLO_CONF', '0.25'))
 TRAIN_EPOCHS = int(os.environ.get('YOLO_TRAIN_EPOCHS', '50'))
 TRAIN_IMGSZ = int(os.environ.get('YOLO_TRAIN_IMGSZ', '640'))
+TRAIN_BATCH = int(os.environ.get('YOLO_TRAIN_BATCH', '-1'))
 
 
 class YOLOSegBackend(LabelStudioMLBase):
@@ -109,6 +110,7 @@ class YOLOSegBackend(LabelStudioMLBase):
                 task='segment',
                 epochs=TRAIN_EPOCHS,
                 imgsz=TRAIN_IMGSZ,
+                batch=TRAIN_BATCH,
                 workers=0,
                 plots=False,
             )
