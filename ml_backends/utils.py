@@ -42,9 +42,11 @@ def ls_get(url: str, **kwargs) -> requests.Response:
 
 
 def get_image_path(image_uri: str, task_id: int) -> str:
-    if image_uri.startswith('s3://') or image_uri.startswith('/data/'):
-        presign_url = f'{LS_URL}/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe="")}'
+    if image_uri.startswith('s3://') or image_uri.startswith('gs://') or image_uri.startswith('azure://'):
+        presign_url = f'{LS_URL}/api/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe="")}'
         resp = ls_get(presign_url, timeout=30, allow_redirects=True)
+    elif image_uri.startswith('/data/'):
+        resp = ls_get(f'{LS_URL}{image_uri}', timeout=30)
     else:
         resp = ls_get(image_uri, timeout=30)
 
@@ -185,11 +187,13 @@ def export_annotations_to_yolo(project_id: int, output_dir: Path, split: float =
             ext = Path(image_uri.split('?')[0]).suffix or '.jpg'
             img_dest = output_dir / 'images' / split_name / f'{stem}{ext}'
             try:
-                if image_uri.startswith('/data/') or image_uri.startswith('s3://'):
+                if image_uri.startswith('s3://') or image_uri.startswith('gs://') or image_uri.startswith('azure://'):
                     resp = ls_get(
-                        f'{LS_URL}/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe="")}',
+                        f'{LS_URL}/api/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe="")}',
                         timeout=30, allow_redirects=True,
                     )
+                elif image_uri.startswith('/data/'):
+                    resp = ls_get(f'{LS_URL}{image_uri}', timeout=30)
                 else:
                     resp = requests.get(image_uri, timeout=30)
                     resp.raise_for_status()
