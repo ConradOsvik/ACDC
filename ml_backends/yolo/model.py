@@ -1,16 +1,34 @@
 import os
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from PIL import Image
 from label_studio_ml.model import LabelStudioMLBase
 from ultralytics import YOLO
 from utils import LS_URL, ls_get, get_image_path, get_brush_label_config, polygons_to_mask, polygons_to_brush_result, export_annotations_to_yolo
 
-MODEL_PATH = Path(os.environ.get('YOLO_MODEL_PATH', 'yolo26m-seg.pt'))
+WEIGHTS_DIR = Path(os.environ.get('YOLO_WEIGHTS_DIR', '/data/weights'))
+DEFAULT_MODEL = 'yolo26m-seg.pt'
 CONF_THRESHOLD = float(os.environ.get('YOLO_CONF', '0.25'))
 TRAIN_EPOCHS = int(os.environ.get('YOLO_TRAIN_EPOCHS', '50'))
 TRAIN_IMGSZ = int(os.environ.get('YOLO_TRAIN_IMGSZ', '640'))
+
+
+def load_model() -> YOLO:
+    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    candidates = sorted(WEIGHTS_DIR.glob('*.pt'), key=lambda p: p.stat().st_mtime, reverse=True)
+    if candidates:
+        print(f"Loading YOLO model from {candidates[0]}...")
+        return YOLO(str(candidates[0]))
+    print(f"No weights found in {WEIGHTS_DIR}, downloading {DEFAULT_MODEL}...")
+    model = YOLO(DEFAULT_MODEL)
+    src = Path(DEFAULT_MODEL)
+    if src.exists():
+        dest = WEIGHTS_DIR / DEFAULT_MODEL
+        shutil.move(str(src), dest)
+        print(f"[YOLO] Saved downloaded weights to {dest}")
+    return model
 
 
 class YOLOSegBackend(LabelStudioMLBase):
@@ -18,9 +36,8 @@ class YOLOSegBackend(LabelStudioMLBase):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        print(f"Loading YOLO model from {MODEL_PATH}...")
         try:
-            self.model = YOLO(str(MODEL_PATH))
+            self.model = load_model()
             print(f"[YOLO] Model loaded successfully")
         except Exception as e:
             print(f"[YOLO] ERROR loading model: {e}")
@@ -31,8 +48,7 @@ class YOLOSegBackend(LabelStudioMLBase):
 
     def _ensure_model_loaded(self):
         if not hasattr(self, 'model') or self.model is None:
-            print(f"[YOLO] Model not loaded, loading from {MODEL_PATH}...")
-            self.model = YOLO(str(MODEL_PATH))
+            self.model = load_model()
 
     def predict(self, tasks, context=None, **kwargs):
         self._ensure_model_loaded()
@@ -114,9 +130,12 @@ class YOLOSegBackend(LabelStudioMLBase):
             )
 
             best = Path(results.save_dir) / 'weights' / 'best.pt'
-            MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(best, MODEL_PATH)
+            WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            dest = WEIGHTS_DIR / f'yolo_{timestamp}.pt'
+            shutil.copy(best, dest)
+            print(f"[YOLO fit] Saved new weights to {dest}")
 
-        self.model = YOLO(str(MODEL_PATH))
-        print(f"[YOLO fit] Training complete. Model saved to {MODEL_PATH}")
-        return {'model_path': str(MODEL_PATH)}
+        self.model = YOLO(str(dest))
+        print(f"[YOLO fit] Training complete.")
+        return {'model_path': str(dest)}
