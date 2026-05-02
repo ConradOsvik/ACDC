@@ -4,7 +4,7 @@ WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN pip install --no-cache-dir \
-    label-studio-ml label-studio-converter redis rq requests \
+    label-studio-ml label-studio-sdk label-studio-converter redis rq requests \
     timm huggingface-hub safetensors \
     git+https://github.com/ultralytics/CLIP.git
 
