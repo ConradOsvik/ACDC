@@ -171,7 +171,7 @@ class YOLOSegBackend(LabelStudioMLBase):
                 print(f"[YOLO fit] Cannot train: {e}", flush=True)
                 return {}
 
-            print(f"[YOLO fit] Exported {exported} tasks ({skipped} skipped without brush regions)", flush=True)
+            print(f"[YOLO fit] Exported {exported} tasks ({skipped} skipped)", flush=True)
             if exported < 2:
                 print(
                     f"[YOLO fit] Cannot train: need at least 2 tasks with brush annotations "
