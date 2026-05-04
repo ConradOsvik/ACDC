@@ -14,15 +14,32 @@ def docker_exec(container: str, *cmd: str) -> None:
     _run(["docker", "exec", container, *cmd])
 
 
+def docker_exec_python(container: str, script: str) -> str:
+    """Run a Python script string inside the container via stdin, return stdout."""
+    result = subprocess.run(
+        ["docker", "exec", "-i", container, "python", "-"],
+        input=script,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"Script in container failed:\n{result.stderr}")
+    return result.stdout
+
+
 def compose_up(
     *compose_files: str,
     services: list[str] | None = None,
     env_file: str | None = None,
     recreate: bool = False,
     wait: bool = False,
+    build: bool = False,
 ) -> None:
     cmd = _compose_cmd(compose_files, env_file)
     cmd += ["up", "-d"]
+    if build:
+        cmd.append("--build")
     if recreate:
         cmd.append("--force-recreate")
     if wait:
@@ -72,7 +89,7 @@ def _compose_cmd(compose_files: tuple[str, ...], env_file: str | None) -> list[s
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         print(f"Command failed: {' '.join(cmd)}", file=sys.stderr)
         if result.stderr:

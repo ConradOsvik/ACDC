@@ -123,6 +123,7 @@ def _prompt_for_token(env_path: Path, base_url: str) -> str:
 
 def up(
     gpu: bool = typer.Option(False, help="Use the GPU compose variant for the model containers"),
+    build: bool = typer.Option(False, "--build", help="Rebuild images before starting"),
     env_file: Optional[str] = typer.Option(None, help="Path to .env file"),
 ) -> None:
     """Bring the full stack up (Label Studio + Postgres + ML backends)."""
@@ -137,7 +138,7 @@ def up(
         raise typer.Exit(1)
 
     info(f"Starting stack ({'GPU' if gpu else 'CPU'} models)...")
-    compose_up(settings.compose_ui_file, models, env_file=settings.env_file)
+    compose_up(settings.compose_ui_file, models, env_file=settings.env_file, build=build)
     success(f"Stack up. Label Studio: {settings.label_studio_url}")
 
 

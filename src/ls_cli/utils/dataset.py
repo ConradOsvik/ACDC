@@ -59,6 +59,7 @@ def export_yolo_dataset(
     *,
     split: float = 0.8,
     seed: int = 42,
+    test_split: float = 0.0,
 ) -> tuple[list[str], int, int]:
     """Export annotated tasks from a project as a YOLO segmentation dataset.
 
@@ -91,20 +92,33 @@ def export_yolo_dataset(
     random.seed(seed)
     random.shuffle(tasks)
     n = len(tasks)
-    split_idx = max(1, min(n - 1, int(n * split)))
-    splits = {"train": tasks[:split_idx], "val": tasks[split_idx:]}
+
+    n_test = max(1, int(n * test_split)) if test_split > 0 else 0
+    test_tasks = tasks[:n_test]
+    remaining = tasks[n_test:]
+
+    n_rem = len(remaining)
+    split_idx = max(1, min(n_rem - 1, int(n_rem * split)))
+    splits: dict[str, list] = {
+        "train": remaining[:split_idx],
+        "val": remaining[split_idx:],
+    }
+    if test_tasks:
+        splits["test"] = test_tasks
 
     for split_name in splits:
         (output_dir / "images" / split_name).mkdir(parents=True, exist_ok=True)
         (output_dir / "labels" / split_name).mkdir(parents=True, exist_ok=True)
 
-    (output_dir / "data.yaml").write_text(
-        f"path: {output_dir.resolve()}\n"
-        f"train: images/train\n"
-        f"val: images/val\n"
-        f"nc: {len(classes)}\n"
-        f"names: {classes}\n"
-    )
+    yaml_lines = [
+        f"path: {output_dir.resolve()}",
+        "train: images/train",
+        "val: images/val",
+    ]
+    if test_tasks:
+        yaml_lines.append("test: images/test")
+    yaml_lines += [f"nc: {len(classes)}", f"names: {classes}"]
+    (output_dir / "data.yaml").write_text("\n".join(yaml_lines) + "\n")
 
     exported = skipped = 0
 

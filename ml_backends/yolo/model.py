@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import sys
@@ -155,6 +156,17 @@ class YOLOSegBackend(LabelStudioMLBase):
             print("[YOLO fit] Could not determine project id; skipping training", flush=True)
             return {}
 
+        train_config_path = Path("/data/train_config.json")
+        test_split = 0.0
+        if train_config_path.is_file():
+            try:
+                cfg = json.loads(train_config_path.read_text())
+                test_split = float(cfg.get("test_split", 0.0))
+                print(f"[YOLO fit] Test split: {test_split:.0%} of tasks held out", flush=True)
+            except Exception as e:
+                print(f"[YOLO fit] Could not read train_config.json: {e}", flush=True)
+            train_config_path.unlink(missing_ok=True)
+
         print(
             f"[YOLO fit] Starting training for project {project_id} "
             f"(epochs={TRAIN_EPOCHS}, imgsz={TRAIN_IMGSZ}, batch={TRAIN_BATCH})",
@@ -164,14 +176,16 @@ class YOLOSegBackend(LabelStudioMLBase):
         with tempfile.TemporaryDirectory() as tmpdir:
             dataset_dir = Path(tmpdir) / "dataset"
             try:
-                classes, exported, skipped = export_annotations_to_yolo(project_id, dataset_dir)
+                classes, exported, skipped = export_annotations_to_yolo(
+                    project_id, dataset_dir, test_split=test_split
+                )
             except ValueError as e:
                 # Configuration / dataset-shape problem (no labels, too few tasks, etc.)
                 # These are user-actionable; surface them clearly and stop.
                 print(f"[YOLO fit] Cannot train: {e}", flush=True)
                 return {}
 
-            print(f"[YOLO fit] Exported {exported} tasks ({skipped} skipped)", flush=True)
+            print(f"[YOLO fit] Exported {exported} tasks ({skipped} skipped without brush regions)", flush=True)
             if exported < 2:
                 print(
                     f"[YOLO fit] Cannot train: need at least 2 tasks with brush annotations "
@@ -189,14 +203,44 @@ class YOLOSegBackend(LabelStudioMLBase):
                 imgsz=TRAIN_IMGSZ,
                 batch=TRAIN_BATCH,
                 workers=0,
-                plots=True,         # Writes results.png, confusion_matrix.png, P/R/F1/PR_curve.png, val_batch*.jpg
-                verbose=True,
+                plots=True,
                 project="/data/runs",
                 name=run_name,
                 exist_ok=False,
             )
 
             best = Path(results.save_dir) / "weights" / "best.pt"
+
+            if test_split > 0 and (dataset_dir / "images" / "test").is_dir():
+                print("[YOLO fit] Evaluating on held-out test split...", flush=True)
+                try:
+                    val_results = YOLO(str(best)).val(
+                        data=str(dataset_dir / "data.yaml"),
+                        split="test",
+                        verbose=True,
+                        plots=True,
+                        workers=0,
+                        project=str(results.save_dir),
+                        name="test",
+                        exist_ok=True,
+                    )
+                    metrics_data = dict(val_results.results_dict)
+                    try:
+                        for i, cls_idx in enumerate(val_results.box.ap_class_index):
+                            cls_name = val_results.names[int(cls_idx)]
+                            metrics_data[f"class/{cls_name}/box_mAP50"] = float(val_results.box.ap50[i])
+                            metrics_data[f"class/{cls_name}/box_mAP50-95"] = float(val_results.box.ap[i])
+                            if hasattr(val_results, "seg"):
+                                metrics_data[f"class/{cls_name}/mask_mAP50"] = float(val_results.seg.ap50[i])
+                                metrics_data[f"class/{cls_name}/mask_mAP50-95"] = float(val_results.seg.ap[i])
+                    except Exception as e:
+                        print(f"[YOLO fit] Per-class metrics unavailable: {e}", flush=True)
+                    metrics_path = Path(results.save_dir) / "test_metrics.json"
+                    metrics_path.write_text(json.dumps(metrics_data))
+                    print(f"[YOLO fit] Test metrics saved → {metrics_path}", flush=True)
+                except Exception as e:
+                    print(f"[YOLO fit] Test evaluation failed: {e}", flush=True)
+
             WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
             dest = WEIGHTS_DIR / f"yolo_{timestamp}.pt"
             shutil.copy(best, dest)

@@ -54,6 +54,7 @@ class RunSummary:
     hparams: dict[str, Any] = field(default_factory=dict)
     final_metrics: dict[str, float] = field(default_factory=dict)
     best_metrics: dict[str, float] = field(default_factory=dict)
+    test_metrics: dict[str, float] = field(default_factory=dict)
     epochs_completed: int = 0
     has_plots: bool = False
     has_weights: bool = False
@@ -92,6 +93,14 @@ def load_run(path: Path) -> RunSummary:
             summary.epochs_completed = len(rows)
             summary.final_metrics = rows[-1]
             summary.best_metrics = _pick_best_epoch(rows)
+
+    test_json = path / "test_metrics.json"
+    if test_json.is_file():
+        import json
+        try:
+            summary.test_metrics = json.loads(test_json.read_text())
+        except Exception:
+            pass
 
     summary.has_plots = any((path / plot).is_file() for plot in PLOT_FILES)
     summary.has_weights = (path / "weights" / "best.pt").is_file()

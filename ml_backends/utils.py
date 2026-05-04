@@ -8,6 +8,7 @@ auth headers.
 """
 
 import base64
+import json
 import os
 import random
 import tempfile
@@ -114,7 +115,8 @@ def mask_to_yolo_polygons(mask: np.ndarray, min_area_px: int = 25) -> list[list[
 
 
 def export_annotations_to_yolo(
-    project_id: int, output_dir: Path, split: float = 0.8, seed: int = 42
+    project_id: int, output_dir: Path, split: float = 0.8, seed: int = 42,
+    test_split: float = 0.0,
 ) -> tuple[list[str], int, int]:
     """Fetch annotated tasks from LS and write a YOLO segmentation dataset.
 
@@ -142,23 +144,36 @@ def export_annotations_to_yolo(
 
     random.seed(seed)
     random.shuffle(tasks)
-    # Guarantee at least one task in each split — otherwise YOLO errors with
-    # "No images found in train/val".
     n = len(tasks)
-    split_idx = max(1, min(n - 1, int(n * split)))
-    splits = {'train': tasks[:split_idx], 'val': tasks[split_idx:]}
+
+    n_test = max(1, int(n * test_split)) if test_split > 0 else 0
+    test_tasks = tasks[:n_test]
+    remaining = tasks[n_test:]
+
+    n_rem = len(remaining)
+    split_idx = max(1, min(n_rem - 1, int(n_rem * split)))
+    splits: dict[str, list] = {'train': remaining[:split_idx], 'val': remaining[split_idx:]}
+    if test_tasks:
+        splits['test'] = test_tasks
 
     for split_name in splits:
         (output_dir / 'images' / split_name).mkdir(parents=True, exist_ok=True)
         (output_dir / 'labels' / split_name).mkdir(parents=True, exist_ok=True)
 
-    (output_dir / 'data.yaml').write_text(
-        f'path: {output_dir.resolve()}\n'
-        f'train: images/train\n'
-        f'val: images/val\n'
-        f'nc: {len(classes)}\n'
-        f'names: {classes}\n'
-    )
+    yaml_lines = [
+        f'path: {output_dir.resolve()}',
+        'train: images/train',
+        'val: images/val',
+    ]
+    if test_tasks:
+        yaml_lines.append('test: images/test')
+    yaml_lines += [f'nc: {len(classes)}', f'names: {classes}']
+    (output_dir / 'data.yaml').write_text('\n'.join(yaml_lines) + '\n')
+
+    if test_tasks:
+        (output_dir / 'test_ids.json').write_text(
+            json.dumps([t['id'] for t in test_tasks])
+        )
 
     exported = skipped = 0
 
