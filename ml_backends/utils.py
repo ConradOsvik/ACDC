@@ -1,54 +1,65 @@
+"""Shared helpers for the YOLO and SAM3 ML backends.
+
+Auth: we delegate to the official label-studio-sdk client, which transparently
+handles both legacy "Token" auth and JWT refresh-token auth depending on the
+shape of LABEL_STUDIO_API_KEY. Anything not exposed by the SDK (binary image
+downloads via /tasks/<id>/resolve) goes through requests with the SDK's
+auth headers.
+"""
+
+import base64
+import json
 import os
 import random
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import quote
+
 import cv2
 import numpy as np
 import requests
 from PIL import Image, ImageDraw
 from label_studio_converter.brush import mask2rle
+from label_studio_sdk.client import LabelStudio
 
-LS_URL = os.environ.get('LABEL_STUDIO_URL', 'http://localhost:8080')
+LS_URL = os.environ.get('LABEL_STUDIO_URL', 'http://localhost:8080').rstrip('/')
 LS_API_KEY = os.environ.get('LABEL_STUDIO_API_KEY', '')
 
-_access_token_cache = {'token': None}
+_client: LabelStudio | None = None
 
 
-def _get_access_token(force_refresh: bool = False) -> str:
-    if _access_token_cache['token'] and not force_refresh:
-        return _access_token_cache['token']
-    resp = requests.post(
-        f'{LS_URL}/api/token/refresh/',
-        json={'refresh': LS_API_KEY},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    token = resp.json()['access']
-    _access_token_cache['token'] = token
-    return token
+def get_ls_client() -> LabelStudio:
+    global _client
+    if _client is None:
+        _client = LabelStudio(base_url=LS_URL, api_key=LS_API_KEY)
+    return _client
+
+
+def _auth_headers() -> dict:
+    return get_ls_client()._client_wrapper.get_headers()
 
 
 def ls_get(url: str, **kwargs) -> requests.Response:
-    token = _get_access_token()
-    resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, **kwargs)
-    if resp.status_code == 401:
-        token = _get_access_token(force_refresh=True)
-        resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, **kwargs)
+    """GET against the LS server. Accepts a path or a full URL."""
+    if not url.startswith('http'):
+        url = f'{LS_URL}{url}' if url.startswith('/') else f'{LS_URL}/{url}'
+    resp = requests.get(url, headers=_auth_headers(), **kwargs)
     resp.raise_for_status()
     return resp
 
 
 def get_image_path(image_uri: str, task_id: int) -> str:
-    if image_uri.startswith('s3://') or image_uri.startswith('gs://') or image_uri.startswith('azure://'):
-        presign_url = f'{LS_URL}/api/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe="")}'
-        resp = ls_get(presign_url, timeout=30, allow_redirects=True)
+    """Download the image referenced by an LS task and return a local path."""
+    if image_uri.startswith(('s3://', 'gs://', 'azure://')):
+        fileuri_b64 = base64.b64encode(image_uri.encode()).decode()
+        url = f'/tasks/{task_id}/resolve/?fileuri={fileuri_b64}'
+        resp = ls_get(url, timeout=30, allow_redirects=True)
     elif image_uri.startswith('/data/'):
-        resp = ls_get(f'{LS_URL}{image_uri}', timeout=30)
-    else:
         resp = ls_get(image_uri, timeout=30)
+    else:
+        resp = requests.get(image_uri, timeout=30)
+        resp.raise_for_status()
 
     suffix = os.path.splitext(image_uri.split('?')[0])[-1] or '.jpg'
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -77,7 +88,7 @@ def polygons_to_mask(polygons_xy, height: int, width: int) -> np.ndarray:
         if len(polygon_xy) < 3:
             continue
         draw.polygon([(float(x), float(y)) for x, y in polygon_xy], fill=255)
-    return np.array(mask_img)  # 0 or 255, uint8 — mask2rle thresholds at 128
+    return np.array(mask_img)
 
 
 def rle_to_mask(rle: list, width: int, height: int) -> np.ndarray:
@@ -103,12 +114,15 @@ def mask_to_yolo_polygons(mask: np.ndarray, min_area_px: int = 25) -> list[list[
     return polygons
 
 
-def export_annotations_to_yolo(project_id: int, output_dir: Path, split: float = 0.8, seed: int = 42) -> tuple[list[str], int, int]:
-    """
-    Fetch all annotated tasks from Label Studio and write a YOLO segmentation dataset.
+def export_annotations_to_yolo(
+    project_id: int, output_dir: Path, split: float = 0.8, seed: int = 42,
+    test_split: float = 0.0,
+) -> tuple[list[str], int, int]:
+    """Fetch annotated tasks from LS and write a YOLO segmentation dataset.
+
     Returns (class_names, exported_count, skipped_count).
     """
-    project = ls_get(f'{LS_URL}/api/projects/{project_id}/', timeout=10).json()
+    project = ls_get(f'/api/projects/{project_id}/', timeout=10).json()
     xml_root = ET.fromstring(project['label_config'])
     classes: list[str] = []
     for brush_labels in xml_root.findall('.//BrushLabels'):
@@ -120,24 +134,46 @@ def export_annotations_to_yolo(project_id: int, output_dir: Path, split: float =
     if not classes:
         raise ValueError('No BrushLabels found in project label config')
 
-    tasks = ls_get(f'{LS_URL}/api/projects/{project_id}/export?exportType=JSON', timeout=120).json()
+    tasks = ls_get(f'/api/projects/{project_id}/export?exportType=JSON', timeout=120).json()
+
+    if len(tasks) < 2:
+        raise ValueError(
+            f"Need at least 2 tasks to build a train/val split (project has {len(tasks)}). "
+            "Upload more images and annotate them, then click Start Training again."
+        )
 
     random.seed(seed)
     random.shuffle(tasks)
-    split_idx = int(len(tasks) * split)
-    splits = {'train': tasks[:split_idx], 'val': tasks[split_idx:]}
+    n = len(tasks)
+
+    n_test = max(1, int(n * test_split)) if test_split > 0 else 0
+    test_tasks = tasks[:n_test]
+    remaining = tasks[n_test:]
+
+    n_rem = len(remaining)
+    split_idx = max(1, min(n_rem - 1, int(n_rem * split)))
+    splits: dict[str, list] = {'train': remaining[:split_idx], 'val': remaining[split_idx:]}
+    if test_tasks:
+        splits['test'] = test_tasks
 
     for split_name in splits:
         (output_dir / 'images' / split_name).mkdir(parents=True, exist_ok=True)
         (output_dir / 'labels' / split_name).mkdir(parents=True, exist_ok=True)
 
-    (output_dir / 'data.yaml').write_text(
-        f'path: {output_dir.resolve()}\n'
-        f'train: images/train\n'
-        f'val: images/val\n'
-        f'nc: {len(classes)}\n'
-        f'names: {classes}\n'
-    )
+    yaml_lines = [
+        f'path: {output_dir.resolve()}',
+        'train: images/train',
+        'val: images/val',
+    ]
+    if test_tasks:
+        yaml_lines.append('test: images/test')
+    yaml_lines += [f'nc: {len(classes)}', f'names: {classes}']
+    (output_dir / 'data.yaml').write_text('\n'.join(yaml_lines) + '\n')
+
+    if test_tasks:
+        (output_dir / 'test_ids.json').write_text(
+            json.dumps([t['id'] for t in test_tasks])
+        )
 
     exported = skipped = 0
 
@@ -153,7 +189,7 @@ def export_annotations_to_yolo(project_id: int, output_dir: Path, split: float =
                 r for a in annotations for r in a.get('result', [])
                 if r.get('type') == 'brushlabels'
             ]
-            is_negative = not brush_results  # confirmed empty annotation = background image
+            is_negative = not brush_results
 
             stem = f'task_{task_id:06d}'
             yolo_lines: list[str] = []
@@ -187,13 +223,14 @@ def export_annotations_to_yolo(project_id: int, output_dir: Path, split: float =
             ext = Path(image_uri.split('?')[0]).suffix or '.jpg'
             img_dest = output_dir / 'images' / split_name / f'{stem}{ext}'
             try:
-                if image_uri.startswith('s3://') or image_uri.startswith('gs://') or image_uri.startswith('azure://'):
+                if image_uri.startswith(('s3://', 'gs://', 'azure://')):
+                    fileuri_b64 = base64.b64encode(image_uri.encode()).decode()
                     resp = ls_get(
-                        f'{LS_URL}/api/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe="")}',
+                        f'/tasks/{task_id}/resolve/?fileuri={fileuri_b64}',
                         timeout=30, allow_redirects=True,
                     )
                 elif image_uri.startswith('/data/'):
-                    resp = ls_get(f'{LS_URL}{image_uri}', timeout=30)
+                    resp = ls_get(image_uri, timeout=30)
                 else:
                     resp = requests.get(image_uri, timeout=30)
                     resp.raise_for_status()

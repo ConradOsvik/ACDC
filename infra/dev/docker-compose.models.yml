@@ -5,21 +5,23 @@ services:
       context: ../../ml_backends
       dockerfile: yolo/Dockerfile
     container_name: yolo-seg
+    env_file:
+      - ../../.env
     environment:
-      - LABEL_STUDIO_URL=http://label-studio:8080
-      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
-      - YOLO_WEIGHTS_DIR=${YOLO_WEIGHTS_DIR:-/data/weights}
-      - YOLO_CONF=${YOLO_CONF:-0.25}
-      - YOLO_TRAIN_EPOCHS=${YOLO_TRAIN_EPOCHS:-50}
-      - YOLO_TRAIN_IMGSZ=${YOLO_TRAIN_IMGSZ:-640}
-      - YOLO_TRAIN_BATCH=${YOLO_TRAIN_BATCH:--1}
-      - LABEL_STUDIO_ML_BACKEND_V2=True
+      LABEL_STUDIO_URL: http://label-studio:8080
     ports:
       - "9090:9090"
     volumes:
       - yolo-data:/data
+      - ../../runs/yolo:/data/runs
     networks:
       - ls-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/health').read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
 
   sam3:
     build:
@@ -27,10 +29,11 @@ services:
       dockerfile: sam3/Dockerfile
     container_name: sam3
     mem_limit: 8g
+    env_file:
+      - ../../.env
     environment:
-      - LABEL_STUDIO_URL=http://label-studio:8080
-      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
-      - SAM3_MODEL_PATH=/models/sam3.pt
+      LABEL_STUDIO_URL: http://label-studio:8080
+      SAM3_MODEL_PATH: /models/sam3.pt
     ports:
       - "9091:9090"
     volumes:
@@ -38,6 +41,12 @@ services:
       - sam3-data:/data
     networks:
       - ls-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/health').read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 240s
 
 networks:
   ls-net:
