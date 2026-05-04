@@ -3,17 +3,17 @@
 Auth: we delegate to the official label-studio-sdk client, which transparently
 handles both legacy "Token" auth and JWT refresh-token auth depending on the
 shape of LABEL_STUDIO_API_KEY. Anything not exposed by the SDK (binary image
-downloads via /api/tasks/<id>/presign) goes through requests with the SDK's
+downloads via /tasks/<id>/resolve) goes through requests with the SDK's
 auth headers.
 """
 
+import base64
 import os
 import random
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import quote
 
 import cv2
 import numpy as np
@@ -51,7 +51,8 @@ def ls_get(url: str, **kwargs) -> requests.Response:
 def get_image_path(image_uri: str, task_id: int) -> str:
     """Download the image referenced by an LS task and return a local path."""
     if image_uri.startswith(('s3://', 'gs://', 'azure://')):
-        url = f'/api/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe="")}'
+        fileuri_b64 = base64.b64encode(image_uri.encode()).decode()
+        url = f'/tasks/{task_id}/resolve/?fileuri={fileuri_b64}'
         resp = ls_get(url, timeout=30, allow_redirects=True)
     elif image_uri.startswith('/data/'):
         resp = ls_get(image_uri, timeout=30)
@@ -208,8 +209,9 @@ def export_annotations_to_yolo(
             img_dest = output_dir / 'images' / split_name / f'{stem}{ext}'
             try:
                 if image_uri.startswith(('s3://', 'gs://', 'azure://')):
+                    fileuri_b64 = base64.b64encode(image_uri.encode()).decode()
                     resp = ls_get(
-                        f'/api/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe="")}',
+                        f'/tasks/{task_id}/resolve/?fileuri={fileuri_b64}',
                         timeout=30, allow_redirects=True,
                     )
                 elif image_uri.startswith('/data/'):

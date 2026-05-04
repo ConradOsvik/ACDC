@@ -153,8 +153,10 @@ def export_yolo_dataset(
             img_dest = output_dir / "images" / split_name / f"{stem}{ext}"
             try:
                 if image_uri.startswith(("s3://", "gs://", "azure://")):
+                    import base64
+                    fileuri_b64 = base64.b64encode(image_uri.encode()).decode()
                     img_resp = requests.get(
-                        f"{base}/api/tasks/{task_id}/presign/?fileuri={quote(image_uri, safe='')}",
+                        f"{base}/tasks/{task_id}/resolve/?fileuri={fileuri_b64}",
                         headers=headers, timeout=30, allow_redirects=True,
                     )
                     img_resp.raise_for_status()
