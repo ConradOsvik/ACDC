@@ -158,11 +158,16 @@ class YOLOSegBackend(LabelStudioMLBase):
 
         train_config_path = Path("/data/train_config.json")
         test_split = 0.0
+        max_images = None
         if train_config_path.is_file():
             try:
                 cfg = json.loads(train_config_path.read_text())
                 test_split = float(cfg.get("test_split", 0.0))
-                print(f"[YOLO fit] Test split: {test_split:.0%} of tasks held out", flush=True)
+                max_images = cfg.get("max_images")
+                if test_split > 0:
+                    print(f"[YOLO fit] Test split: {test_split:.0%} of tasks held out", flush=True)
+                if max_images is not None:
+                    print(f"[YOLO fit] Max images: using random subset of {max_images}", flush=True)
             except Exception as e:
                 print(f"[YOLO fit] Could not read train_config.json: {e}", flush=True)
             train_config_path.unlink(missing_ok=True)
@@ -177,7 +182,7 @@ class YOLOSegBackend(LabelStudioMLBase):
             dataset_dir = Path(tmpdir) / "dataset"
             try:
                 classes, exported, skipped = export_annotations_to_yolo(
-                    project_id, dataset_dir, test_split=test_split
+                    project_id, dataset_dir, test_split=test_split, max_images=max_images
                 )
             except ValueError as e:
                 # Configuration / dataset-shape problem (no labels, too few tasks, etc.)

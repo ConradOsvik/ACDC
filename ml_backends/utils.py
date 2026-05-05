@@ -116,7 +116,7 @@ def mask_to_yolo_polygons(mask: np.ndarray, min_area_px: int = 25) -> list[list[
 
 def export_annotations_to_yolo(
     project_id: int, output_dir: Path, split: float = 0.8, seed: int = 42,
-    test_split: float = 0.0,
+    test_split: float = 0.0, max_images: int | None = None,
 ) -> tuple[list[str], int, int]:
     """Fetch annotated tasks from LS and write a YOLO segmentation dataset.
 
@@ -134,7 +134,34 @@ def export_annotations_to_yolo(
     if not classes:
         raise ValueError('No BrushLabels found in project label config')
 
-    tasks = ls_get(f'/api/projects/{project_id}/export?exportType=JSON', timeout=120).json()
+    if max_images is not None:
+        # Fetch only annotated task IDs (lightweight), randomly sample, then export just those.
+        all_ids: list[int] = []
+        page_size = 1000
+        page = 1
+        while True:
+            resp = ls_get(
+                f'/api/tasks?project={project_id}&page_size={page_size}&page={page}',
+                timeout=60,
+            ).json()
+            tasks_page = resp.get('tasks', [])
+            # keep only tasks that have at least one annotation
+            all_ids.extend(t['id'] for t in tasks_page if t.get('total_annotations', 0) > 0)
+            total = resp.get('total', 0)
+            if len(all_ids) >= total or not tasks_page or len(tasks_page) < page_size:
+                break
+            page += 1
+        random.seed(seed)
+        random.shuffle(all_ids)
+        selected_ids = all_ids[:max_images]
+        ids_qs = '&'.join(f'ids[]={i}' for i in selected_ids)
+        tasks = ls_get(
+            f'/api/projects/{project_id}/export?exportType=JSON&{ids_qs}',
+            timeout=120,
+        ).json()
+        print(f'[export] Sampled {len(tasks)} of {len(all_ids)} annotated tasks', flush=True)
+    else:
+        tasks = ls_get(f'/api/projects/{project_id}/export?exportType=JSON', timeout=120).json()
 
     if len(tasks) < 2:
         raise ValueError(
