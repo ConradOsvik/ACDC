@@ -5,6 +5,8 @@ import sys
 import tempfile
 import threading
 import traceback
+
+import torch
 from datetime import datetime
 from pathlib import Path
 
@@ -201,6 +203,7 @@ class YOLOSegBackend(LabelStudioMLBase):
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             run_name = f"train_{timestamp}"
+            torch.cuda.empty_cache()
             results = self.model.train(
                 data=str(dataset_dir / "data.yaml"),
                 task="segment",

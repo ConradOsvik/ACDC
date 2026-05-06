@@ -20,6 +20,7 @@ services:
       - YOLO_TRAIN_EPOCHS=${YOLO_TRAIN_EPOCHS:-50}
       - YOLO_TRAIN_IMGSZ=${YOLO_TRAIN_IMGSZ:-640}
       - YOLO_TRAIN_BATCH=${YOLO_TRAIN_BATCH:--1}
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - LABEL_STUDIO_ML_BACKEND_V2=True
     ports:
       - "9090:9090"

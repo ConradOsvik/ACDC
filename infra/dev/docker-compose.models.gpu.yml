@@ -16,6 +16,7 @@ services:
       - ../../.env
     environment:
       LABEL_STUDIO_URL: http://label-studio:8080
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     ports:
       - "9090:9090"
     volumes:
