@@ -55,6 +55,7 @@ class RunSummary:
     final_metrics: dict[str, float] = field(default_factory=dict)
     best_metrics: dict[str, float] = field(default_factory=dict)
     test_metrics: dict[str, float] = field(default_factory=dict)
+    test_ids: list[int] = field(default_factory=list)
     epochs_completed: int = 0
     has_plots: bool = False
     has_weights: bool = False
@@ -99,6 +100,14 @@ def load_run(path: Path) -> RunSummary:
         import json
         try:
             summary.test_metrics = json.loads(test_json.read_text())
+        except Exception:
+            pass
+
+    test_ids_json = path / "test_ids.json"
+    if test_ids_json.is_file():
+        import json
+        try:
+            summary.test_ids = json.loads(test_ids_json.read_text())
         except Exception:
             pass
 

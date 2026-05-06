@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import json
+import random
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import cv2
+import numpy as np
+import requests
 import typer
+from label_studio_sdk.converter.brush import decode_rle
 
+from ls_cli.client import auth_headers, get_client
+from ls_cli.config import Settings
+from ls_cli.utils.dataset import export_yolo_dataset, visualize_yolo_dataset
 from ls_cli.utils.docker import (
     compose_restart,
     container_inspect_env,
@@ -14,8 +25,10 @@ from ls_cli.utils.docker import (
     docker_cp,
     docker_exec,
     docker_exec_python,
+    resolve_backend_url,
 )
-from ls_cli.utils.output import console, error, info, success
+from ls_cli.utils.metrics import KEY_HPARAMS, export_run, f1_from_pr, list_runs
+from ls_cli.utils.output import console, error, info, print_table, success
 
 app = typer.Typer(help="Manage the YOLO segmentation backend.")
 
@@ -30,8 +43,6 @@ def deploy(
     env_file: Optional[str] = typer.Option(None, help="Path to .env file"),
 ) -> None:
     """Deploy YOLO weights: copy into the volume and restart so the model picks them up."""
-    from ls_cli.config import Settings
-
     settings = Settings.load(env_file, require_api_key=False)
 
     if not weights.is_file():
@@ -83,10 +94,6 @@ def export(
     env_file: Optional[str] = typer.Option(None, help="Path to .env file"),
 ) -> None:
     """Export annotated tasks as a YOLO segmentation dataset."""
-    from ls_cli.client import get_client
-    from ls_cli.config import Settings
-    from ls_cli.utils.dataset import export_yolo_dataset
-
     settings = Settings.load(env_file)
     ls = get_client(settings)
     pid = _resolve_project_id(ls, project_id)
@@ -111,8 +118,6 @@ def visualize(
     save_dir: Optional[Path] = typer.Option(None, help="Save PNGs here instead of showing interactively"),
 ) -> None:
     """Render image + polygon overlays for an exported dataset."""
-    from ls_cli.utils.dataset import visualize_yolo_dataset
-
     if split not in ("train", "val", "all"):
         error(f"--split must be one of: train, val, all (got {split})")
         raise typer.Exit(1)
@@ -147,9 +152,6 @@ def train(
 
     Pass --max-images 200 to train on a random subset of 200 images.
     """
-    from ls_cli.client import get_client
-    from ls_cli.config import Settings
-
     settings = Settings.load(env_file)
     ls = get_client(settings)
     pid = _resolve_project_id(ls, project_id)
@@ -187,10 +189,6 @@ def train(
 
 def _start_training(settings, ls, backend_id: int) -> None:
     """Start a training run via the LS API. Tries the SDK first, then a raw POST."""
-    import requests
-
-    from ls_cli.client import auth_headers
-
     train_method = getattr(ls.ml, "train", None)
     if callable(train_method):
         try:
@@ -210,111 +208,295 @@ def _start_training(settings, ls, backend_id: int) -> None:
 
 @app.command()
 def evaluate(
-    dataset_dir: Path = typer.Option(Path("exports/yolo_dataset"), help="Dataset directory with a test split"),
-    run: Optional[str] = typer.Option(None, "--run", "-r", help="Training run whose weights to use (default: latest)"),
-    container: str = typer.Option(CONTAINER_NAME, help="YOLO container name"),
+    project_id: Optional[int] = typer.Option(None, help="Project ID (auto-resolved if only one)"),
+    max_images: Optional[int] = typer.Option(
+        None, "--max-images", "-n", help="Random sample of N annotated tasks (default: all)"
+    ),
+    seed: int = typer.Option(42, help="Random seed for --max-images sampling"),
+    run: Optional[str] = typer.Option(None, "--run", "-r", help="Training run whose test_ids.json to use (default: latest run with a test split)"),
+    export: Optional[Path] = typer.Option(None, "--export", help="Save results as JSON to this file or directory"),
+    url: Optional[str] = typer.Option(None, "--url", help="Override the YOLO predict endpoint (e.g. http://localhost:9090)"),
+    env_file: Optional[str] = typer.Option(None, help="Path to .env file"),
 ) -> None:
-    """Evaluate the model on the held-out test split and report metrics.
+    """Evaluate YOLO prediction quality against ground truth annotations using IoU.
 
-    Export the dataset with a test split first:
-      ls-cli yolo export --test-split 0.1
+    For each annotated task, YOLO's predictions are compared to the human-verified
+    brush annotations. Reports per-class and overall mean IoU.
+
+    Use --url to override the YOLO endpoint when running the CLI from outside
+    Docker (e.g. --url http://localhost:9090).
     """
-    import json
-    import subprocess
+    settings = Settings.load(env_file)
+    ls = get_client(settings)
+    pid = _resolve_project_id(ls, project_id)
 
-    from ls_cli.utils.output import print_table
+    yolo_url = url.rstrip("/") if url else resolve_backend_url(settings.yolo_url, "yolo-seg")
+    base = settings.label_studio_url.rstrip("/")
 
-    if not container_is_running(container):
-        error(f"Container '{container}' is not running.")
+    try:
+        proj_resp = requests.get(
+            f"{base}/api/projects/{pid}/",
+            headers=auth_headers(ls),
+            timeout=30,
+        )
+        proj_resp.raise_for_status()
+    except requests.RequestException as exc:
+        error(f"Could not fetch project from Label Studio: {exc}")
         raise typer.Exit(1)
 
-    test_img_dir = dataset_dir / "images" / "test"
-    if not test_img_dir.is_dir() or not any(test_img_dir.iterdir()):
-        error(
-            f"No test split found in {dataset_dir}. "
-            "Re-export with: ls-cli yolo export --test-split 0.1"
-        )
+    project_data = proj_resp.json()
+    label_config: str = project_data.get("label_config", "")
+    project_title: str = project_data.get("title", f"Project {pid}")
+
+    info(f"Project: {project_title} (id={pid})")
+    info(f"YOLO endpoint: {yolo_url}")
+
+    classes: list[str] = []
+    try:
+        xml_root = ET.fromstring(label_config)
+        for brush_labels in xml_root.findall(".//BrushLabels"):
+            for label_el in brush_labels.findall("Label"):
+                v = label_el.get("value")
+                if v and v not in classes:
+                    classes.append(v)
+    except ET.ParseError as exc:
+        error(f"Could not parse label config: {exc}")
         raise typer.Exit(1)
 
-    # Resolve weights path inside the container.
-    if run:
-        weights = f"/data/runs/{run}/weights/best.pt"
-    else:
-        result = subprocess.run(
-            ["docker", "exec", container, "python", "-c",
-             "from pathlib import Path; w=sorted(Path('/data/weights').glob('*.pt'),"
-             "key=lambda p:p.stat().st_mtime,reverse=True); print(w[0] if w else '')"],
-            capture_output=True, text=True,
+    if not classes:
+        error("No BrushLabels found in the project label config.")
+        raise typer.Exit(1)
+    info(f"Classes: {classes}")
+
+    try:
+        export_resp = requests.get(
+            f"{base}/api/projects/{pid}/export?exportType=JSON",
+            headers=auth_headers(ls),
+            timeout=120,
         )
-        weights = result.stdout.strip()
-        if not weights:
-            error("No weights found in the container. Train the model first.")
+        export_resp.raise_for_status()
+    except requests.RequestException as exc:
+        error(f"Could not export tasks from Label Studio: {exc}")
+        raise typer.Exit(1)
+
+    tasks = [t for t in export_resp.json() if t.get("annotations")]
+    if not tasks:
+        error("No annotated tasks found. Annotate some tasks first.")
+        raise typer.Exit(1)
+
+    test_ids = _load_test_ids(run)
+    if test_ids is not None:
+        id_set = set(test_ids)
+        tasks = [t for t in tasks if t["id"] in id_set]
+        if not tasks:
+            error("None of the test-split tasks have annotations. Did you annotate the held-out images?")
             raise typer.Exit(1)
+        info(f"Filtered to {len(tasks)} held-out test task(s) from run '{run or 'latest'}'.")
+    else:
+        info("[WARN] No test split found — evaluating on all annotated tasks (comparison will be biased for YOLO).")
 
-    info(f"Weights: {weights}")
-    info(f"Dataset: {dataset_dir.resolve()}")
+    if max_images is not None and len(tasks) > max_images:
+        random.seed(seed)
+        tasks = random.sample(tasks, max_images)
 
-    # Copy dataset into the container.
-    container_dataset = "/tmp/_ls_eval_dataset"
-    docker_exec(container, "rm", "-rf", container_dataset)
-    docker_cp(str(dataset_dir.resolve()), f"{container}:{container_dataset}")
-
-    script = f"""
-import json, yaml
-from pathlib import Path
-from ultralytics import YOLO
-
-dataset = Path({repr(container_dataset)})
-cfg = yaml.safe_load((dataset / 'data.yaml').read_text())
-cfg['path'] = str(dataset)
-(dataset / 'data.yaml').write_text(yaml.dump(cfg))
-
-model = YOLO({repr(weights)})
-r = model.val(data=str(dataset / 'data.yaml'), split='test', plots=False, verbose=False)
-print('METRICS:' + json.dumps(r.results_dict))
-"""
-
-    info("Running evaluation (this may take a minute)...")
-    raw = docker_exec_python(container, script)
-
-    metrics_line = next((l for l in raw.splitlines() if l.startswith("METRICS:")), None)
-    if not metrics_line:
-        error("No metrics returned from the container.")
+    try:
+        requests.post(
+            f"{yolo_url}/setup",
+            json={
+                "project": str(pid),
+                "schema": label_config,
+                "hostname": settings.label_studio_url,
+                "access_token": settings.label_studio_api_key,
+            },
+            timeout=30,
+        ).raise_for_status()
+    except requests.RequestException as exc:
+        error(f"Could not set up YOLO model: {exc}")
         raise typer.Exit(1)
 
-    m = json.loads(metrics_line[len("METRICS:"):])
+    info(f"Evaluating {len(tasks)} task(s)...\n")
 
-    def _fmt(v) -> str:
-        if v is None:
-            return "—"
+    def _rle_to_mask(rle: list, width: int, height: int) -> np.ndarray:
+        decoded = np.array(decode_rle(rle), dtype=np.uint8).reshape(height, width, 4)
+        return (decoded[:, :, 3] > 0).astype(np.uint8)
+
+    def _mask_metrics(
+        a: np.ndarray, b: np.ndarray
+    ) -> tuple[float | None, float | None, float | None]:
+        """Return (IoU, Dice, Recall) for a GT mask `a` and predicted mask `b`."""
+        if a.shape != b.shape:
+            b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST)
+        inter = float(np.logical_and(a, b).sum())
+        union = float(np.logical_or(a, b).sum())
+        gt_sum = float(a.sum())
+        pred_sum = float(b.sum())
+        iou = inter / union if union > 0 else None
+        dice = (2 * inter) / (gt_sum + pred_sum) if (gt_sum + pred_sum) > 0 else None
+        recall = inter / gt_sum if gt_sum > 0 else None
+        return iou, dice, recall
+
+    class_ious: dict[str, list[float]] = {cls: [] for cls in classes}
+    class_dices: dict[str, list[float]] = {cls: [] for cls in classes}
+    class_recalls: dict[str, list[float]] = {cls: [] for cls in classes}
+    failed = 0
+
+    for task in tasks:
+        task_id = task["id"]
+        image_uri = task.get("data", {}).get("image", "")
+
+        gt_masks: dict[str, np.ndarray | None] = {cls: None for cls in classes}
+        for annotation in task.get("annotations", []):
+            if annotation.get("was_cancelled"):
+                continue
+            for result in annotation.get("result", []):
+                if result.get("type") != "brushlabels":
+                    continue
+                value = result.get("value", {})
+                rle = value.get("rle", [])
+                label_names = value.get("brushlabels", [])
+                if not rle or not label_names or label_names[0] not in classes:
+                    continue
+                cls = label_names[0]
+                w = result.get("original_width", 100)
+                h = result.get("original_height", 100)
+                try:
+                    m = _rle_to_mask(rle, w, h)
+                    existing_gt = gt_masks[cls]
+                    gt_masks[cls] = m if existing_gt is None else np.logical_or(existing_gt, m).astype(np.uint8)
+                except Exception as exc:
+                    info(f"  [WARN] task {task_id}: GT decode error: {exc}")
+
+        payload = {
+            "tasks": [{"id": task_id, "data": {"image": image_uri}}],
+            "project": str(pid),
+            "label_config": label_config,
+            "params": {},
+        }
         try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return str(v)
-        return "—" if f != f else f"{f:.4f}"
+            pred_resp = requests.post(
+                f"{yolo_url}/predict",
+                json=payload,
+                timeout=60,
+            )
+            pred_resp.raise_for_status()
+            pred_data = pred_resp.json()
+        except requests.RequestException as exc:
+            info(f"  [WARN] task {task_id}: predict failed: {exc}")
+            failed += 1
+            continue
 
-    from ls_cli.utils.metrics import f1_from_pr
-    bp = m.get("metrics/precision(B)", 0) or 0
-    br = m.get("metrics/recall(B)", 0) or 0
-    mp = m.get("metrics/precision(M)", 0) or 0
-    mr = m.get("metrics/recall(M)", 0) or 0
+        pred_masks: dict[str, np.ndarray | None] = {cls: None for cls in classes}
+        task_results = pred_data.get("results", [{}])
+        for result in (task_results[0].get("result", []) if task_results else []):
+            if result.get("type") != "brushlabels":
+                continue
+            value = result.get("value", {})
+            rle = value.get("rle", [])
+            label_names = value.get("brushlabels", [])
+            if not rle or not label_names or label_names[0] not in classes:
+                continue
+            cls = label_names[0]
+            w = result.get("original_width", 100)
+            h = result.get("original_height", 100)
+            try:
+                m = _rle_to_mask(rle, w, h)
+                existing_pred = pred_masks[cls]
+                pred_masks[cls] = m if existing_pred is None else np.logical_or(existing_pred, m).astype(np.uint8)
+            except Exception as exc:
+                info(f"  [WARN] task {task_id}: pred decode error: {exc}")
 
-    rows = [
-        ("Box mAP50",      _fmt(m.get("metrics/mAP50(B)"))),
-        ("Box mAP50-95",   _fmt(m.get("metrics/mAP50-95(B)"))),
-        ("Box precision",  _fmt(bp)),
-        ("Box recall",     _fmt(br)),
-        ("Box F1",         _fmt(f1_from_pr(bp, br))),
-        ("Mask mAP50",     _fmt(m.get("metrics/mAP50(M)"))),
-        ("Mask mAP50-95",  _fmt(m.get("metrics/mAP50-95(M)"))),
-        ("Mask precision", _fmt(mp)),
-        ("Mask recall",    _fmt(mr)),
-        ("Mask F1",        _fmt(f1_from_pr(mp, mr))),
-    ]
-    label = run or "latest"
-    print_table(f"Test-set evaluation (weights: {label})", ["Metric", "Value"], rows)
+        for cls in classes:
+            gt = gt_masks[cls]
+            pred = pred_masks[cls]
+            if gt is None and pred is None:
+                continue
+            if gt is None:
+                if pred is None:
+                    continue
+                gt_arr, pred_arr = np.zeros_like(pred), pred
+            elif pred is None:
+                gt_arr, pred_arr = gt, np.zeros_like(gt)
+            else:
+                gt_arr, pred_arr = gt, pred
+            iou, dice, recall = _mask_metrics(gt_arr, pred_arr)
+            if iou is not None:
+                class_ious[cls].append(iou)
+            if dice is not None:
+                class_dices[cls].append(dice)
+            if recall is not None:
+                class_recalls[cls].append(recall)
 
-    docker_exec(container, "rm", "-rf", container_dataset)
+    def _mean(values: list[float]) -> str:
+        return f"{sum(values) / len(values):.4f}" if values else "—"
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    all_ious: list[float] = []
+    all_dices: list[float] = []
+    all_recalls: list[float] = []
+    for cls in classes:
+        rows.append((
+            cls,
+            _mean(class_ious[cls]),
+            _mean(class_dices[cls]),
+            _mean(class_recalls[cls]),
+            str(len(class_ious[cls])),
+        ))
+        all_ious.extend(class_ious[cls])
+        all_dices.extend(class_dices[cls])
+        all_recalls.extend(class_recalls[cls])
+
+    if all_ious:
+        rows.append((
+            "OVERALL",
+            _mean(all_ious),
+            _mean(all_dices),
+            _mean(all_recalls),
+            str(len(all_ious)),
+        ))
+
+    print_table(
+        f"YOLO evaluation — {len(tasks)} task(s), {len(classes)} class(es)",
+        ["Class", "Mean IoU", "Dice", "Recall", "Tasks"],
+        rows,
+    )
+
+    if export is not None:
+        def _mean_f(values: list[float]) -> float | None:
+            return sum(values) / len(values) if values else None
+
+        data: dict = {
+            "model": "yolo",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "project_id": pid,
+            "run": run,
+            "tasks_evaluated": len(tasks),
+            "classes": {
+                cls: {
+                    "iou": _mean_f(class_ious[cls]),
+                    "dice": _mean_f(class_dices[cls]),
+                    "recall": _mean_f(class_recalls[cls]),
+                    "n": len(class_ious[cls]),
+                }
+                for cls in classes
+            },
+            "overall": {
+                "iou": _mean_f(all_ious),
+                "dice": _mean_f(all_dices),
+                "recall": _mean_f(all_recalls),
+                "n": len(all_ious),
+            },
+        }
+        out = Path(export)
+        if out.is_dir() or not out.suffix:
+            out.mkdir(parents=True, exist_ok=True)
+            out = out / f"yolo_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        else:
+            out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(data, indent=2))
+        success(f"Results saved → {out}")
+
+    if failed:
+        info(f"\n{failed} task(s) failed. Is YOLO running and reachable at {yolo_url}?")
 
 
 @app.command()
@@ -324,15 +506,11 @@ def runs(
     ),
 ) -> None:
     """List all training runs with key hyperparameters and final metrics."""
-    from ls_cli.utils.metrics import KEY_HPARAMS, KEY_METRICS, list_runs
-    from ls_cli.utils.output import print_table
-
     all_runs = list_runs()
     if not all_runs:
         info("No training runs found in runs/yolo/. Run training first.")
         return
 
-    # Sort
     sort_key_map = {
         "mtime": lambda r: r.path.stat().st_mtime,
         "mAP50": lambda r: r.best_metrics.get("metrics/mAP50(M)") or r.best_metrics.get("metrics/mAP50(B)") or 0,
@@ -364,9 +542,6 @@ def metrics(
     export: Optional[Path] = typer.Option(None, "--export", help="Copy plots + CSV + args to this dir"),
 ) -> None:
     """Show detailed metrics for a training run, or export them for a report."""
-    from ls_cli.utils.metrics import KEY_HPARAMS, export_run, f1_from_pr, list_runs, load_run
-    from ls_cli.utils.output import print_table
-
     runs_list = list_runs()
     if not runs_list:
         error("No training runs found in runs/yolo/. Run training first.")
@@ -385,13 +560,11 @@ def metrics(
     info(f"Path: {target.path}")
     info("")
 
-    # Hyperparameters
     if target.hparams:
         rows = [(k, target.hparams.get(k, "—")) for k in KEY_HPARAMS]
         print_table("Hyperparameters", ["Key", "Value"], rows)
         info("")
 
-    # Metrics — best epoch
     if target.best_metrics:
         bp = target.best_metrics.get("metrics/precision(B)") or 0
         br = target.best_metrics.get("metrics/recall(B)") or 0
@@ -414,7 +587,6 @@ def metrics(
     else:
         info("No metrics yet (results.csv missing or empty).")
 
-    # Test-set metrics (present only when trained with --test-split)
     if target.test_metrics:
         tp = target.test_metrics.get("metrics/precision(B)") or 0
         tr = target.test_metrics.get("metrics/recall(B)") or 0
@@ -455,7 +627,6 @@ def metrics(
             )
             info("")
 
-    # Plot inventory
     if target.has_plots:
         info(f"Plots available in {target.path} (results.png, confusion_matrix.png, P/R/F1/PR_curve.png, val_batch*.jpg)")
     else:
@@ -477,6 +648,28 @@ def _fmt(v) -> str:
     if f != f:  # NaN
         return "—"
     return f"{f:.4f}"
+
+
+def _load_test_ids(run: str | None) -> list[int] | None:
+    """Return the held-out task IDs from a training run's test_ids.json.
+
+    Looks up runs/yolo/<run>/test_ids.json, defaulting to the latest run
+    that has one. Returns None if no test split is found.
+    """
+    all_runs = list_runs()
+    if not all_runs:
+        return None
+    if run:
+        match = next((r for r in all_runs if r.name == run), None)
+        if not match:
+            error(f"No run named '{run}'. Try: ls-cli yolo runs")
+            raise typer.Exit(1)
+        target = match
+    else:
+        target = next((r for r in all_runs if r.test_ids), None)
+        if target is None:
+            return None
+    return target.test_ids or None
 
 
 def _resolve_project_id(ls, project_id: int | None) -> int:

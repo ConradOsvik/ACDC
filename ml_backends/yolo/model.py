@@ -220,6 +220,11 @@ class YOLOSegBackend(LabelStudioMLBase):
             best = Path(results.save_dir) / "weights" / "best.pt"
 
             if test_split > 0 and (dataset_dir / "images" / "test").is_dir():
+                test_ids_src = dataset_dir / "test_ids.json"
+                if test_ids_src.is_file():
+                    shutil.copy(test_ids_src, Path(results.save_dir) / "test_ids.json")
+                    print(f"[YOLO fit] Test IDs saved → {Path(results.save_dir) / 'test_ids.json'}", flush=True)
+
                 print("[YOLO fit] Evaluating on held-out test split...", flush=True)
                 try:
                     val_results = YOLO(str(best)).val(
