@@ -56,6 +56,10 @@ class RunSummary:
     best_metrics: dict[str, float] = field(default_factory=dict)
     test_metrics: dict[str, float] = field(default_factory=dict)
     test_ids: list[int] = field(default_factory=list)
+    images_trained_on: int | None = None
+    max_images_limit: int | None = None
+    train_duration_seconds: float | None = None
+    eval_duration_seconds: float | None = None
     epochs_completed: int = 0
     has_plots: bool = False
     has_weights: bool = False
@@ -108,6 +112,18 @@ def load_run(path: Path) -> RunSummary:
         import json
         try:
             summary.test_ids = json.loads(test_ids_json.read_text())
+        except Exception:
+            pass
+
+    ls_info_json = path / "ls_train_info.json"
+    if ls_info_json.is_file():
+        import json
+        try:
+            info = json.loads(ls_info_json.read_text())
+            summary.images_trained_on = info.get("images_trained_on")
+            summary.max_images_limit = info.get("max_images_limit")
+            summary.train_duration_seconds = info.get("train_duration_seconds")
+            summary.eval_duration_seconds = info.get("eval_duration_seconds")
         except Exception:
             pass
 

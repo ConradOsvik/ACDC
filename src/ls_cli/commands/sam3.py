@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -137,6 +138,7 @@ def evaluate(
         raise typer.Exit(1)
 
     info(f"Evaluating {len(tasks)} task(s)...\n")
+    eval_start = time.monotonic()
 
     def _rle_to_mask(rle: list, width: int, height: int) -> np.ndarray:
         decoded = np.array(decode_rle(rle), dtype=np.uint8).reshape(height, width, 4)
@@ -282,7 +284,7 @@ def evaluate(
         ))
 
     print_table(
-        f"SAM3 evaluation — {len(tasks)} task(s), {len(classes)} class(es)",
+        f"SAM3 evaluation — {len(tasks)} task(s), {len(classes)} class(es), {_fmt_duration(time.monotonic() - eval_start)}",
         ["Class", "Mean IoU", "Dice", "Recall", "Tasks"],
         rows,
     )
@@ -346,6 +348,19 @@ def _load_test_ids(run: str | None) -> list[int] | None:
         if target is None:
             return None
     return target.test_ids or None
+
+
+def _fmt_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
 
 
 def _resolve_project_id(ls, project_id: int | None) -> int:

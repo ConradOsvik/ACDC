@@ -4,6 +4,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 import torch
@@ -204,6 +205,7 @@ class YOLOSegBackend(LabelStudioMLBase):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             run_name = f"train_{timestamp}"
             torch.cuda.empty_cache()
+            train_start = time.monotonic()
             results = self.model.train(
                 data=str(dataset_dir / "data.yaml"),
                 task="segment",
@@ -216,8 +218,10 @@ class YOLOSegBackend(LabelStudioMLBase):
                 name=run_name,
                 exist_ok=False,
             )
+            train_duration = time.monotonic() - train_start
 
             best = Path(results.save_dir) / "weights" / "best.pt"
+            eval_duration: float | None = None
 
             if test_split > 0 and (dataset_dir / "images" / "test").is_dir():
                 test_ids_src = dataset_dir / "test_ids.json"
@@ -227,6 +231,7 @@ class YOLOSegBackend(LabelStudioMLBase):
 
                 print("[YOLO fit] Evaluating on held-out test split...", flush=True)
                 try:
+                    eval_start = time.monotonic()
                     val_results = YOLO(str(best)).val(
                         data=str(dataset_dir / "data.yaml"),
                         split="test",
@@ -237,6 +242,7 @@ class YOLOSegBackend(LabelStudioMLBase):
                         name="test",
                         exist_ok=True,
                     )
+                    eval_duration = time.monotonic() - eval_start
                     metrics_data = dict(val_results.results_dict)
                     try:
                         for i, cls_idx in enumerate(val_results.box.ap_class_index):
@@ -253,6 +259,15 @@ class YOLOSegBackend(LabelStudioMLBase):
                     print(f"[YOLO fit] Test metrics saved → {metrics_path}", flush=True)
                 except Exception as e:
                     print(f"[YOLO fit] Test evaluation failed: {e}", flush=True)
+
+            info_path = Path(results.save_dir) / "ls_train_info.json"
+            info_path.write_text(json.dumps({
+                "max_images_limit": max_images,
+                "images_trained_on": exported,
+                "test_split": test_split,
+                "train_duration_seconds": round(train_duration, 1),
+                "eval_duration_seconds": round(eval_duration, 1) if eval_duration is not None else None,
+            }))
 
             WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
             dest = WEIGHTS_DIR / f"yolo_{timestamp}.pt"
