@@ -131,6 +131,7 @@ def visualize(
 def train(
     project_id: Optional[int] = typer.Option(None, help="Project ID (auto-resolved if only one)"),
     test_split: float = typer.Option(0.0, "--test-split", help="Fraction held out as test set, evaluated after training (e.g. 0.1)"),
+    max_images: Optional[int] = typer.Option(None, "--max-images", help="Randomly sample this many images for training (uses all if unset)"),
     container: str = typer.Option(CONTAINER_NAME, help="YOLO container name"),
     env_file: Optional[str] = typer.Option(None, help="Path to .env file"),
 ) -> None:
@@ -143,6 +144,8 @@ def train(
     Pass --test-split 0.1 to hold out 10%% of tasks as a true test set.
     The backend will evaluate on them after training and save results to
     runs/yolo/<run>/test_metrics.json.
+
+    Pass --max-images 200 to train on a random subset of 200 images.
     """
     from ls_cli.client import get_client
     from ls_cli.config import Settings
@@ -156,16 +159,23 @@ def train(
         error(f"No YOLO backend attached to project {pid}. Run: ls-cli backend switch {pid} yolo")
         raise typer.Exit(1)
 
-    if test_split > 0:
+    if test_split > 0 or max_images is not None:
         if not container_is_running(container):
             error(f"Container '{container}' is not running.")
             raise typer.Exit(1)
-        import json as _json
+        cfg: dict = {}
+        if test_split > 0:
+            cfg["test_split"] = test_split
+        if max_images is not None:
+            cfg["max_images"] = max_images
         docker_exec_python(
             container,
-            f"import json; open('/data/train_config.json','w').write(json.dumps({{'test_split': {test_split}}}))",
+            f"import json; open('/data/train_config.json','w').write(json.dumps({cfg}))",
         )
-        info(f"Test split: {test_split:.0%} of tasks held out for post-training evaluation.")
+        if test_split > 0:
+            info(f"Test split: {test_split:.0%} of tasks held out for post-training evaluation.")
+        if max_images is not None:
+            info(f"Max images: training on a random subset of {max_images} images.")
 
     backend = backends[0]
     info(f"Triggering training on '{backend.title}' (id={backend.id}) for project {pid}...")
