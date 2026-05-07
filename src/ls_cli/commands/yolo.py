@@ -579,8 +579,9 @@ print('PREDICTIONS:' + json.dumps(results))
         ))
 
     elapsed = time.monotonic() - eval_start
+    trained_on = f", trained on {target_run.images_trained_on} image(s)" if target_run and target_run.images_trained_on is not None else ""
     print_table(
-        f"YOLO evaluation — {len(tasks)} task(s), {len(classes)} class(es), {_fmt_duration(elapsed)}",
+        f"YOLO evaluation — {len(tasks)} task(s), {len(classes)} class(es){trained_on}, {_fmt_duration(elapsed)}",
         ["Class", "Mean IoU", "Dice", "Recall", "Tasks"],
         rows,
     )
@@ -594,6 +595,7 @@ print('PREDICTIONS:' + json.dumps(results))
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "project_id": pid,
             "run": target_run.name if target_run else None,
+            "images_trained_on": target_run.images_trained_on if target_run else None,
             "tasks_evaluated": len(tasks),
             "classes": {
                 cls: {
