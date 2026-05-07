@@ -497,6 +497,9 @@ print('PREDICTIONS:' + json.dumps(results))
     class_ious: dict[str, list[float]] = {cls: [] for cls in classes}
     class_dices: dict[str, list[float]] = {cls: [] for cls in classes}
     class_recalls: dict[str, list[float]] = {cls: [] for cls in classes}
+    class_tp50: dict[str, int] = {cls: 0 for cls in classes}
+    class_fp50: dict[str, int] = {cls: 0 for cls in classes}
+    class_fn50: dict[str, int] = {cls: 0 for cls in classes}
 
     for task in tasks:
         task_id = task["id"]
@@ -549,20 +552,40 @@ print('PREDICTIONS:' + json.dumps(results))
                 class_dices[cls].append(dice)
             if recall is not None:
                 class_recalls[cls].append(recall)
+            gt_exists = gt is not None and gt.sum() > 0
+            pred_exists = pred is not None and pred.sum() > 0
+            if gt_exists and pred_exists and iou is not None and iou >= 0.5:
+                class_tp50[cls] += 1
+            else:
+                if pred_exists:
+                    class_fp50[cls] += 1
+                if gt_exists:
+                    class_fn50[cls] += 1
 
     def _mean(values: list[float]) -> str:
         return f"{sum(values) / len(values):.4f}" if values else "—"
 
-    rows: list[tuple[str, str, str, str, str]] = []
+    rows: list[tuple] = []
     all_ious: list[float] = []
     all_dices: list[float] = []
     all_recalls: list[float] = []
+    all_ap50: list[float] = []
+    all_rec50: list[float] = []
     for cls in classes:
+        tp, fp, fn = class_tp50[cls], class_fp50[cls], class_fn50[cls]
+        ap50 = tp / (tp + fp) if (tp + fp) > 0 else None
+        rec50 = tp / (tp + fn) if (tp + fn) > 0 else None
+        if ap50 is not None:
+            all_ap50.append(ap50)
+        if rec50 is not None:
+            all_rec50.append(rec50)
         rows.append((
             cls,
             _mean(class_ious[cls]),
             _mean(class_dices[cls]),
             _mean(class_recalls[cls]),
+            f"{ap50:.4f}" if ap50 is not None else "—",
+            f"{rec50:.4f}" if rec50 is not None else "—",
             str(len(class_ious[cls])),
         ))
         all_ious.extend(class_ious[cls])
@@ -575,6 +598,8 @@ print('PREDICTIONS:' + json.dumps(results))
             _mean(all_ious),
             _mean(all_dices),
             _mean(all_recalls),
+            _mean(all_ap50),
+            _mean(all_rec50),
             str(len(all_ious)),
         ))
 
@@ -582,7 +607,7 @@ print('PREDICTIONS:' + json.dumps(results))
     trained_on = f", trained on {target_run.images_trained_on} image(s)" if target_run and target_run.images_trained_on is not None else ""
     print_table(
         f"YOLO evaluation — {len(tasks)} task(s), {len(classes)} class(es){trained_on}, {_fmt_duration(elapsed)}",
-        ["Class", "Mean IoU", "Dice", "Recall", "Tasks"],
+        ["Class", "Mean IoU", "Dice", "Recall", "mAP@50", "Recall@50", "Tasks"],
         rows,
     )
 
@@ -597,11 +622,14 @@ print('PREDICTIONS:' + json.dumps(results))
             "run": target_run.name if target_run else None,
             "images_trained_on": target_run.images_trained_on if target_run else None,
             "tasks_evaluated": len(tasks),
+            "duration_seconds": round(elapsed, 2),
             "classes": {
                 cls: {
                     "iou": _mean_f(class_ious[cls]),
                     "dice": _mean_f(class_dices[cls]),
                     "recall": _mean_f(class_recalls[cls]),
+                    "ap50": class_tp50[cls] / (class_tp50[cls] + class_fp50[cls]) if (class_tp50[cls] + class_fp50[cls]) > 0 else None,
+                    "recall50": class_tp50[cls] / (class_tp50[cls] + class_fn50[cls]) if (class_tp50[cls] + class_fn50[cls]) > 0 else None,
                     "n": len(class_ious[cls]),
                 }
                 for cls in classes
@@ -610,6 +638,8 @@ print('PREDICTIONS:' + json.dumps(results))
                 "iou": _mean_f(all_ious),
                 "dice": _mean_f(all_dices),
                 "recall": _mean_f(all_recalls),
+                "ap50": _mean_f(all_ap50),
+                "recall50": _mean_f(all_rec50),
                 "n": len(all_ious),
             },
         }

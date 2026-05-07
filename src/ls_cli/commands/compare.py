@@ -333,6 +333,8 @@ print('PREDICTIONS:' + json.dumps(results))
         models.append((label, yolo_masks))
 
     # Render and save one PNG per task
+    from datetime import datetime
+    output_dir = output_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir.mkdir(parents=True, exist_ok=True)
     saved = 0
 
@@ -340,9 +342,9 @@ print('PREDICTIONS:' + json.dumps(results))
         task_id = task["id"]
         image_uri = task.get("data", {}).get("image", "")
 
-        orig = _download_image(image_uri, base, ls)
+        orig, dl_err = _download_image(image_uri, base, ls, task_id)
         if orig is None:
-            info(f"  [WARN] task {task_id}: could not download image, skipping")
+            info(f"  [WARN] task {task_id}: could not download image: {dl_err}")
             continue
 
         panels = [
@@ -433,16 +435,21 @@ def _make_grid(panels: list[Image.Image]) -> Image.Image:
     return grid
 
 
-def _download_image(image_uri: str, base: str, ls) -> Image.Image | None:
+def _download_image(image_uri: str, base: str, ls, task_id: int) -> tuple[Image.Image | None, str | None]:
+    import base64
+    if image_uri.startswith(("s3://", "gs://", "azure://")):
+        fileuri_b64 = base64.b64encode(image_uri.encode()).decode()
+        url = f"{base}/tasks/{task_id}/resolve/?fileuri={fileuri_b64}"
+    elif image_uri.startswith("/data/"):
+        url = f"{base}{image_uri}"
+    else:
+        url = image_uri
     try:
-        if image_uri.startswith("/data/"):
-            resp = requests.get(f"{base}{image_uri}", headers=auth_headers(ls), timeout=30)
-        else:
-            resp = requests.get(image_uri, timeout=30)
+        resp = requests.get(url, headers=auth_headers(ls), timeout=30, allow_redirects=True)
         resp.raise_for_status()
-        return Image.open(io.BytesIO(resp.content)).convert("RGB")
-    except Exception:
-        return None
+        return Image.open(io.BytesIO(resp.content)).convert("RGB"), None
+    except Exception as exc:
+        return None, f"{exc} (url={url})"
 
 
 def _resolve_project_id(ls, project_id: int | None) -> int:

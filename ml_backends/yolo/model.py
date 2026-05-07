@@ -65,6 +65,8 @@ CONF_THRESHOLD = float(os.environ.get("YOLO_CONF", "0.25"))
 TRAIN_EPOCHS = int(os.environ.get("YOLO_TRAIN_EPOCHS", "50"))
 TRAIN_IMGSZ = int(os.environ.get("YOLO_TRAIN_IMGSZ", "640"))
 TRAIN_BATCH = int(os.environ.get("YOLO_TRAIN_BATCH", "-1"))
+TRAIN_LR0 = float(os.environ.get("YOLO_TRAIN_LR0", "0.01"))
+TRAIN_FREEZE = int(os.environ.get("YOLO_TRAIN_FREEZE", "0"))
 
 
 def load_model() -> YOLO:
@@ -177,7 +179,8 @@ class YOLOSegBackend(LabelStudioMLBase):
 
         print(
             f"[YOLO fit] Starting training for project {project_id} "
-            f"(epochs={TRAIN_EPOCHS}, imgsz={TRAIN_IMGSZ}, batch={TRAIN_BATCH})",
+            f"(epochs={TRAIN_EPOCHS}, imgsz={TRAIN_IMGSZ}, batch={TRAIN_BATCH}, "
+            f"lr0={TRAIN_LR0}, freeze={TRAIN_FREEZE if TRAIN_FREEZE > 0 else 'none'})",
             flush=True,
         )
 
@@ -205,13 +208,18 @@ class YOLOSegBackend(LabelStudioMLBase):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             run_name = f"train_{timestamp}"
             torch.cuda.empty_cache()
+            # Always train from the base pretrained model, not the currently deployed one,
+            # to avoid compounding fine-tuning across runs (catastrophic forgetting).
+            train_model = YOLO(DEFAULT_MODEL)
             train_start = time.monotonic()
-            results = self.model.train(
+            results = train_model.train(
                 data=str(dataset_dir / "data.yaml"),
                 task="segment",
                 epochs=TRAIN_EPOCHS,
                 imgsz=TRAIN_IMGSZ,
                 batch=TRAIN_BATCH,
+                lr0=TRAIN_LR0,
+                freeze=TRAIN_FREEZE if TRAIN_FREEZE > 0 else None,
                 workers=0,
                 plots=True,
                 project="/data/runs",
