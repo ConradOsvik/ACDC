@@ -52,6 +52,7 @@ def visualize(
     task_id: Optional[int] = typer.Option(None, "--task-id", "-t", help="Visualize a single specific task by ID"),
     max_images: Optional[int] = typer.Option(None, "--max-images", "-n", help="Limit to N tasks"),
     seed: int = typer.Option(42, help="Random seed for --max-images"),
+    panel_width: int = typer.Option(600, "--panel-width", "-w", help="Width of each panel in pixels"),
     output_dir: Path = typer.Option(Path("exports/visualizations"), "--output", "-o"),
     env_file: Optional[str] = typer.Option(None, help="Path to .env file"),
 ) -> None:
@@ -347,18 +348,23 @@ print('PREDICTIONS:' + json.dumps(results))
             info(f"  [WARN] task {task_id}: could not download image: {dl_err}")
             continue
 
-        panels = [
-            _make_panel(orig, "Original"),
-            _make_panel(_overlay(orig, gt_by_task[task_id]), "Ground Truth"),
+        top_panels = [
+            _make_panel(orig, "Original", panel_width),
+            _make_panel(_overlay(orig, gt_by_task[task_id]), "Ground Truth", panel_width),
         ]
+        bottom_panels: list[Image.Image] = []
         for label, masks_by_task in models:
             task_masks = masks_by_task.get(task_id)
-            if task_masks is None:
-                panels.append(_make_panel(_error_image(orig), f"{label} (failed)"))
+            img = _error_image(orig) if task_masks is None else _overlay(orig, task_masks)
+            title = f"{label} (failed)" if task_masks is None else label
+            panel = _make_panel(img, title, panel_width)
+            if label.startswith("YOLO"):
+                bottom_panels.append(panel)
             else:
-                panels.append(_make_panel(_overlay(orig, task_masks), label))
+                top_panels.append(panel)
 
-        grid = _make_grid(panels)
+        rows = [top_panels, bottom_panels] if bottom_panels else [top_panels]
+        grid = _make_grid(rows)
         out_path = output_dir / f"task_{task_id:06d}.png"
         grid.save(out_path)
         saved += 1
@@ -409,11 +415,11 @@ def _error_image(reference: Image.Image) -> Image.Image:
     return img
 
 
-def _make_panel(image: Image.Image, title: str) -> Image.Image:
+def _make_panel(image: Image.Image, title: str, panel_w: int = _PANEL_W) -> Image.Image:
     w, h = image.size
-    new_h = int(h * _PANEL_W / w)
-    resized = image.resize((_PANEL_W, new_h), Image.LANCZOS)
-    panel = Image.new("RGB", (_PANEL_W, new_h + _HEADER_H), (30, 30, 30))
+    new_h = int(h * panel_w / w)
+    resized = image.resize((panel_w, new_h), Image.LANCZOS)
+    panel = Image.new("RGB", (panel_w, new_h + _HEADER_H), (30, 30, 30))
     draw = ImageDraw.Draw(panel)
     try:
         font = ImageFont.truetype("arial.ttf", 14)
@@ -424,14 +430,26 @@ def _make_panel(image: Image.Image, title: str) -> Image.Image:
     return panel
 
 
-def _make_grid(panels: list[Image.Image]) -> Image.Image:
-    total_w = sum(p.width for p in panels) + _GAP * (len(panels) - 1)
-    max_h = max(p.height for p in panels)
-    grid = Image.new("RGB", (total_w, max_h), (50, 50, 50))
-    x = 0
-    for panel in panels:
-        grid.paste(panel, (x, 0))
-        x += panel.width + _GAP
+def _make_grid(rows: list[list[Image.Image]]) -> Image.Image:
+    row_images: list[Image.Image] = []
+    for panels in rows:
+        if not panels:
+            continue
+        row_w = sum(p.width for p in panels) + _GAP * (len(panels) - 1)
+        row_h = max(p.height for p in panels)
+        row_img = Image.new("RGB", (row_w, row_h), (50, 50, 50))
+        x = 0
+        for panel in panels:
+            row_img.paste(panel, (x, 0))
+            x += panel.width + _GAP
+        row_images.append(row_img)
+    total_w = max(img.width for img in row_images)
+    total_h = sum(img.height for img in row_images) + _GAP * (len(row_images) - 1)
+    grid = Image.new("RGB", (total_w, total_h), (50, 50, 50))
+    y = 0
+    for row_img in row_images:
+        grid.paste(row_img, (0, y))
+        y += row_img.height + _GAP
     return grid
 
 
