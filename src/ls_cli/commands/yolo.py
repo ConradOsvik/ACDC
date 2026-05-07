@@ -26,6 +26,7 @@ from ls_cli.utils.docker import (
     docker_cp,
     docker_exec,
     docker_exec_python,
+    resolve_backend_url,
 )
 from ls_cli.utils.metrics import KEY_HPARAMS, export_run, f1_from_pr, list_runs
 from ls_cli.utils.output import console, error, info, print_table, success
@@ -213,42 +214,34 @@ def evaluate(
         None, "--max-images", "-n", help="Random sample of N annotated tasks (default: all)"
     ),
     seed: int = typer.Option(42, help="Random seed for --max-images sampling"),
-    run: Optional[str] = typer.Option(None, "--run", "-r", help="Training run whose weights and test split to use (default: latest run)"),
+    run: Optional[str] = typer.Option(None, "--run", "-r", help="Load weights from this training run instead of the container's current model"),
     export: Optional[Path] = typer.Option(None, "--export", help="Save results as JSON to this file or directory"),
     container: str = typer.Option(CONTAINER_NAME, help="Docker container name"),
     env_file: Optional[str] = typer.Option(None, help="Path to .env file"),
 ) -> None:
     """Evaluate YOLO prediction quality against ground truth annotations using IoU.
 
-    Loads the specific run's best.pt weights directly inside the container rather
-    than whatever model is currently loaded, so results are tied to that exact run.
-    Reports per-class and overall IoU, Dice, and Recall.
+    By default uses the container's currently loaded model via its HTTP endpoint.
+    Pass --run to load a specific training run's best.pt weights instead.
+    Reports per-class and overall mean IoU, Dice, and Recall.
     """
     settings = Settings.load(env_file)
     ls = get_client(settings)
     pid = _resolve_project_id(ls, project_id)
     base = settings.label_studio_url.rstrip("/")
 
-    # Resolve target run for both weights and test_ids (single list_runs() call)
-    all_runs = list_runs()
+    # Resolve specific run if requested (for weights + optional test_ids filter)
     target_run = None
     if run:
+        all_runs = list_runs()
         target_run = next((r for r in all_runs if r.name == run), None)
         if not target_run:
             error(f"No run named '{run}'. Try: ls-cli yolo runs")
             raise typer.Exit(1)
-    elif all_runs:
-        target_run = (
-            next((r for r in all_runs if r.test_ids and r.has_weights), None)
-            or next((r for r in all_runs if r.has_weights), None)
-        )
-
-    if not target_run or not target_run.has_weights:
-        error("No YOLO run with weights found. Train with: ls-cli yolo train")
-        raise typer.Exit(1)
-
-    weights_path = f"/data/runs/{target_run.name}/weights/best.pt"
-    info(f"Using weights from run: {target_run.name}")
+        if not target_run.has_weights:
+            error(f"Run '{run}' has no weights file (best.pt missing).")
+            raise typer.Exit(1)
+        info(f"Using weights from run: {target_run.name}")
 
     if not container_is_running(container):
         error(f"Container '{container}' is not running. Start it with: ls-cli up")
@@ -304,34 +297,61 @@ def evaluate(
         error("No annotated tasks found. Annotate some tasks first.")
         raise typer.Exit(1)
 
-    if target_run.test_ids:
+    # When a specific run is given, optionally filter to its held-out test_ids
+    if target_run and target_run.test_ids:
         id_set = set(target_run.test_ids)
         filtered = [t for t in tasks if t["id"] in id_set]
         if filtered:
             tasks = filtered
             info(f"Filtered to {len(tasks)} held-out test task(s) from run '{target_run.name}'.")
         else:
-            info(f"Using run '{target_run.name}' weights. No test-split IDs match this project — evaluating all {len(tasks)} task(s).")
-    else:
-        info("[WARN] No test split — evaluating on all annotated tasks (comparison will be biased for YOLO).")
+            info(f"No test-split IDs from run '{target_run.name}' match this project — evaluating all {len(tasks)} task(s).")
 
     if max_images is not None and len(tasks) > max_images:
         random.seed(seed)
         tasks = random.sample(tasks, max_images)
 
-    info(f"Evaluating {len(tasks)} task(s) using {target_run.name}/weights/best.pt...\n")
-    eval_start = time.monotonic()
+    # --- shared helpers ---
 
-    # Run batch prediction inside the container using the run's specific weights
-    tasks_for_script = [
-        {"id": t["id"], "image_uri": t.get("data", {}).get("image", "")}
-        for t in tasks
-    ]
-    label_set_lower = {c.lower() for c in classes}
-    yolo_conf = container_inspect_env(container, "YOLO_CONF") or "0.25"
+    def _rle_to_mask(rle: list, width: int, height: int) -> np.ndarray:
+        decoded = np.array(decode_rle(rle), dtype=np.uint8).reshape(height, width, 4)
+        return (decoded[:, :, 3] > 0).astype(np.uint8)
 
-    batch_script = f"""\
-import json
+    def _mask_metrics(a: np.ndarray, b: np.ndarray) -> tuple[float | None, float | None, float | None]:
+        if a.shape != b.shape:
+            b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST)
+        inter = float(np.logical_and(a, b).sum())
+        union = float(np.logical_or(a, b).sum())
+        gt_sum = float(a.sum())
+        pred_sum = float(b.sum())
+        iou = inter / union if union > 0 else None
+        dice = (2 * inter) / (gt_sum + pred_sum) if (gt_sum + pred_sum) > 0 else None
+        recall = inter / gt_sum if gt_sum > 0 else None
+        return iou, dice, recall
+
+    # --- prediction: two paths → both produce pred_masks_by_task ---
+
+    # pred_masks_by_task maps task_id → {class: mask | None}, or None on failure
+    pred_masks_by_task: dict[int, dict[str, np.ndarray | None] | None] = {}
+    failed = 0
+
+    if target_run:
+        # Docker exec: load run-specific weights, batch-predict, return polygons
+        weights_path = f"/data/runs/{target_run.name}/weights/best.pt"
+        label_set_lower = {c.lower() for c in classes}
+        label_lower_to_cls = {c.lower(): c for c in classes}
+        yolo_conf = container_inspect_env(container, "YOLO_CONF") or "0.25"
+        tasks_for_script = [
+            {"id": t["id"], "image_uri": t.get("data", {}).get("image", "")}
+            for t in tasks
+        ]
+        info(f"Evaluating {len(tasks)} task(s) using {target_run.name}/weights/best.pt...\n")
+        eval_start = time.monotonic()
+
+        batch_script = f"""\
+import sys, json
+sys.path.insert(0, '/app')
+sys.path.insert(0, '/app/yolo-backend')
 from ultralytics import YOLO
 from PIL import Image
 
@@ -362,61 +382,121 @@ for t in tasks_input:
                 preds_out.append({{'class': cls_name, 'width': w, 'height': h, 'polygon': polygon_xy.tolist()}})
         results.append({{'task_id': task_id, 'predictions': preds_out}})
     except Exception as e:
-        import traceback
         results.append({{'task_id': task_id, 'predictions': [], 'error': str(e)}})
 
 print('PREDICTIONS:' + json.dumps(results))
 """
+        try:
+            raw_output = docker_exec_python(container, batch_script)
+        except SystemExit as exc:
+            error(f"Batch prediction in container failed: {exc}")
+            raise typer.Exit(1)
 
-    try:
-        raw_output = docker_exec_python(container, batch_script)
-    except SystemExit as exc:
-        error(f"Batch prediction in container failed: {exc}")
-        raise typer.Exit(1)
+        pred_line = next((ln for ln in raw_output.splitlines() if ln.startswith("PREDICTIONS:")), None)
+        if pred_line is None:
+            error("Container script produced no prediction output.")
+            raise typer.Exit(1)
+        try:
+            batch_predictions: list = json.loads(pred_line[len("PREDICTIONS:"):])
+        except json.JSONDecodeError as exc:
+            error(f"Could not parse prediction output: {exc}")
+            raise typer.Exit(1)
 
-    pred_line = next((ln for ln in raw_output.splitlines() if ln.startswith("PREDICTIONS:")), None)
-    if pred_line is None:
-        error("Container script produced no prediction output.")
-        raise typer.Exit(1)
-    try:
-        batch_predictions: list = json.loads(pred_line[len("PREDICTIONS:"):])
-    except json.JSONDecodeError as exc:
-        error(f"Could not parse prediction output: {exc}")
-        raise typer.Exit(1)
+        def _polygon_to_mask(polygon: list, width: int, height: int) -> np.ndarray:
+            mask = np.zeros((height, width), dtype=np.uint8)
+            if polygon:
+                pts = np.array(polygon, dtype=np.float32).reshape((-1, 1, 2)).astype(np.int32)
+                cv2.fillPoly(mask, [pts], 1)
+            return mask
 
-    pred_by_task = {item["task_id"]: item for item in batch_predictions}
+        for item in batch_predictions:
+            task_id = item["task_id"]
+            if item.get("error"):
+                info(f"  [WARN] task {task_id}: prediction error: {item['error']}")
+                pred_masks_by_task[task_id] = None
+                continue
+            pred_masks: dict[str, np.ndarray | None] = {cls: None for cls in classes}
+            for pred_item in item.get("predictions", []):
+                cls_key = label_lower_to_cls.get(pred_item["class"].lower(), pred_item["class"])
+                if cls_key not in pred_masks:
+                    continue
+                try:
+                    m = _polygon_to_mask(pred_item["polygon"], pred_item["width"], pred_item["height"])
+                    existing = pred_masks[cls_key]
+                    pred_masks[cls_key] = m if existing is None else np.logical_or(existing, m).astype(np.uint8)
+                except Exception as exc:
+                    info(f"  [WARN] task {task_id}: pred decode error: {exc}")
+            pred_masks_by_task[task_id] = pred_masks
 
-    def _rle_to_mask(rle: list, width: int, height: int) -> np.ndarray:
-        decoded = np.array(decode_rle(rle), dtype=np.uint8).reshape(height, width, 4)
-        return (decoded[:, :, 3] > 0).astype(np.uint8)
+    else:
+        # HTTP predict: use the container's currently loaded model
+        yolo_url = resolve_backend_url(settings.yolo_url, container)
+        info(f"YOLO endpoint: {yolo_url}")
+        info(f"Evaluating {len(tasks)} task(s) using container's current model...\n")
+        eval_start = time.monotonic()
 
-    def _polygon_to_mask(polygon: list, width: int, height: int) -> np.ndarray:
-        mask = np.zeros((height, width), dtype=np.uint8)
-        if polygon:
-            pts = np.array(polygon, dtype=np.float32).reshape((-1, 1, 2)).astype(np.int32)
-            cv2.fillPoly(mask, [pts], 1)
-        return mask
+        try:
+            requests.post(
+                f"{yolo_url}/setup",
+                json={
+                    "project": str(pid),
+                    "schema": label_config,
+                    "hostname": settings.label_studio_url,
+                    "access_token": settings.label_studio_api_key,
+                },
+                timeout=30,
+            ).raise_for_status()
+        except requests.RequestException as exc:
+            error(f"Could not set up YOLO model: {exc}")
+            raise typer.Exit(1)
 
-    def _mask_metrics(
-        a: np.ndarray, b: np.ndarray
-    ) -> tuple[float | None, float | None, float | None]:
-        """Return (IoU, Dice, Recall) for a GT mask `a` and predicted mask `b`."""
-        if a.shape != b.shape:
-            b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST)
-        inter = float(np.logical_and(a, b).sum())
-        union = float(np.logical_or(a, b).sum())
-        gt_sum = float(a.sum())
-        pred_sum = float(b.sum())
-        iou = inter / union if union > 0 else None
-        dice = (2 * inter) / (gt_sum + pred_sum) if (gt_sum + pred_sum) > 0 else None
-        recall = inter / gt_sum if gt_sum > 0 else None
-        return iou, dice, recall
+        for task in tasks:
+            task_id = task["id"]
+            image_uri = task.get("data", {}).get("image", "")
+            try:
+                pred_resp = requests.post(
+                    f"{yolo_url}/predict",
+                    json={
+                        "tasks": [{"id": task_id, "data": {"image": image_uri}}],
+                        "project": str(pid),
+                        "label_config": label_config,
+                        "params": {},
+                    },
+                    timeout=60,
+                )
+                pred_resp.raise_for_status()
+                pred_data = pred_resp.json()
+            except requests.RequestException as exc:
+                info(f"  [WARN] task {task_id}: predict failed: {exc}")
+                pred_masks_by_task[task_id] = None
+                continue
 
-    label_lower_to_cls = {c.lower(): c for c in classes}
+            pred_masks = {cls: None for cls in classes}
+            task_results = pred_data.get("results", [{}])
+            for result in (task_results[0].get("result", []) if task_results else []):
+                if result.get("type") != "brushlabels":
+                    continue
+                value = result.get("value", {})
+                rle = value.get("rle", [])
+                label_names = value.get("brushlabels", [])
+                if not rle or not label_names or label_names[0] not in classes:
+                    continue
+                cls = label_names[0]
+                w = result.get("original_width", 100)
+                h = result.get("original_height", 100)
+                try:
+                    m = _rle_to_mask(rle, w, h)
+                    existing = pred_masks[cls]
+                    pred_masks[cls] = m if existing is None else np.logical_or(existing, m).astype(np.uint8)
+                except Exception as exc:
+                    info(f"  [WARN] task {task_id}: pred decode error: {exc}")
+            pred_masks_by_task[task_id] = pred_masks
+
+    # --- metrics ---
+
     class_ious: dict[str, list[float]] = {cls: [] for cls in classes}
     class_dices: dict[str, list[float]] = {cls: [] for cls in classes}
     class_recalls: dict[str, list[float]] = {cls: [] for cls in classes}
-    failed = 0
 
     for task in tasks:
         task_id = task["id"]
@@ -438,30 +518,16 @@ print('PREDICTIONS:' + json.dumps(results))
                 h = result.get("original_height", 100)
                 try:
                     m = _rle_to_mask(rle, w, h)
-                    existing_gt = gt_masks[cls]
-                    gt_masks[cls] = m if existing_gt is None else np.logical_or(existing_gt, m).astype(np.uint8)
+                    existing = gt_masks[cls]
+                    gt_masks[cls] = m if existing is None else np.logical_or(existing, m).astype(np.uint8)
                 except Exception as exc:
                     info(f"  [WARN] task {task_id}: GT decode error: {exc}")
 
-        task_pred_data = pred_by_task.get(task_id, {})
-        if task_pred_data.get("error"):
-            info(f"  [WARN] task {task_id}: prediction error: {task_pred_data['error']}")
+        pred_masks_or_none = pred_masks_by_task.get(task_id)
+        if pred_masks_or_none is None:
             failed += 1
             continue
-
-        pred_masks: dict[str, np.ndarray | None] = {cls: None for cls in classes}
-        for pred_item in task_pred_data.get("predictions", []):
-            cls_raw = pred_item["class"]
-            cls_key = label_lower_to_cls.get(cls_raw.lower(), cls_raw)
-            if cls_key not in pred_masks:
-                continue
-            pw, ph = pred_item["width"], pred_item["height"]
-            try:
-                m = _polygon_to_mask(pred_item["polygon"], pw, ph)
-                existing_pred = pred_masks[cls_key]
-                pred_masks[cls_key] = m if existing_pred is None else np.logical_or(existing_pred, m).astype(np.uint8)
-            except Exception as exc:
-                info(f"  [WARN] task {task_id}: pred decode error: {exc}")
+        pred_masks: dict[str, np.ndarray | None] = pred_masks_or_none
 
         for cls in classes:
             gt = gt_masks[cls]
@@ -527,7 +593,7 @@ print('PREDICTIONS:' + json.dumps(results))
             "model": "yolo",
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "project_id": pid,
-            "run": target_run.name,
+            "run": target_run.name if target_run else None,
             "tasks_evaluated": len(tasks),
             "classes": {
                 cls: {
