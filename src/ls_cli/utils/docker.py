@@ -70,6 +70,45 @@ def container_inspect_env(container: str, var: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def container_host_port(container: str, internal_port: int) -> str | None:
+    """Return the host port number mapped to internal_port, or None if not found."""
+    result = subprocess.run(
+        ["docker", "port", container, str(internal_port)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        # Lines look like "0.0.0.0:9091" or "[::]:9091"
+        host_port = line.strip().rsplit(":", 1)[-1]
+        if host_port.isdigit():
+            return host_port
+    return None
+
+
+def resolve_backend_url(configured_url: str, container: str, internal_port: int = 9090) -> str:
+    """Return a reachable URL for the backend.
+
+    Tries the configured URL first (quick health check). If that fails — e.g.
+    the hostname is a Docker-internal service name not reachable from the host —
+    falls back to querying `docker port` and building a localhost URL.
+    """
+    import urllib.request
+
+    url = configured_url.rstrip("/")
+    try:
+        urllib.request.urlopen(f"{url}/health", timeout=2)
+        return url
+    except Exception:
+        pass
+
+    host_port = container_host_port(container, internal_port)
+    if host_port:
+        return f"http://localhost:{host_port}"
+    return url
+
+
 def container_is_running(container: str) -> bool:
     result = subprocess.run(
         ["docker", "inspect", "-f", "{{.State.Running}}", container],
