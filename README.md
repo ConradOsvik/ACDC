@@ -102,23 +102,9 @@ ls-cli init
 ls-cli init --gpu
 ```
 
-`init` starts all services, waits for Label Studio to become healthy, creates a project pre-configured with Red Rust and White Rust brush labels, and attaches the YOLO26-seg backend.
+`init` starts all services, waits for Label Studio to become healthy, then pauses and walks you through pasting the API token from the Label Studio UI. Once the token is validated it creates a project pre-configured with Red Rust and White Rust brush labels and attaches the YOLO26-seg backend.
 
-### 4. Set the API key
-
-On first boot, Label Studio creates an admin account using the credentials in `.env`. Get the API token:
-
-1. Open `http://localhost:8080`
-2. Go to **Account & Settings → Access Token**
-3. Copy the token into `.env` as `LABEL_STUDIO_API_KEY=<token>`
-
-Then restart the stack so the CLI and backends can authenticate:
-
-```bash
-ls-cli down && ls-cli up
-```
-
-### 5. Upload images and start annotating
+### 4. Upload images and start annotating
 
 Upload images through the Label Studio UI. The SAM 3 backend will generate draft masks on-the-fly when tasks are opened. Review, correct, and submit each annotation.
 
