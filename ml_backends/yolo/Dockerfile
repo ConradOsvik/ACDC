@@ -3,7 +3,8 @@ FROM ultralytics/ultralytics:latest
 WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN pip install --no-cache-dir label-studio-ml label-studio-sdk label-studio-converter redis rq requests git+https://github.com/ultralytics/CLIP.git
+COPY yolo/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY utils.py .
 COPY yolo/model.py .

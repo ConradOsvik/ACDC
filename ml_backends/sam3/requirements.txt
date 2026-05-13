@@ -1,3 +1,10 @@
 label-studio-ml
-ultralytics
+label-studio-sdk
+label-studio-converter
+redis
+rq
 requests
+timm
+huggingface-hub
+safetensors
+git+https://github.com/ultralytics/CLIP.git

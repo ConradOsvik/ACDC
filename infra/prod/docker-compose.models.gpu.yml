@@ -27,6 +27,14 @@ services:
     volumes:
       - yolo-data:/data
       - ../../runs/yolo:/data/runs
+    networks:
+      - ls-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/health').read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
 
   sam3:
     build:
@@ -51,6 +59,19 @@ services:
     volumes:
       - ../../ml_backends/sam3/sam3.pt:/models/sam3.pt:ro
       - sam3-data:/data
+    networks:
+      - ls-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/health').read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 240s
+
+networks:
+  ls-net:
+    external: true
+    name: ls-net
 
 volumes:
   yolo-data:

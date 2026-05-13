@@ -144,7 +144,7 @@ Install once with `uv sync`, then use `ls-cli` from anywhere inside the project.
 ### Stack lifecycle
 
 ```bash
-ls-cli init [--gpu] [--build]     # Full bootstrap: start stack + create project + attach backend
+ls-cli init [--gpu]               # Full bootstrap: start stack + create project + attach backend
 ls-cli up   [--gpu] [--build]     # Start Label Studio + ML backends
 ls-cli down                        # Stop all services
 ```

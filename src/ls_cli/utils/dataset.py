@@ -6,7 +6,6 @@ import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import quote
 
 from ls_cli.client import auth_headers
 from ls_cli.config import Settings

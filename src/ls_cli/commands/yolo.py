@@ -29,7 +29,7 @@ from ls_cli.utils.docker import (
     resolve_backend_url,
 )
 from ls_cli.utils.metrics import KEY_HPARAMS, export_run, f1_from_pr, list_runs
-from ls_cli.utils.output import console, error, info, print_table, success
+from ls_cli.utils.output import error, info, print_table, success
 
 app = typer.Typer(help="Manage the YOLO segmentation backend.")
 
