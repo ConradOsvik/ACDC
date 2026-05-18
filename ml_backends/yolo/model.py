@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -225,6 +226,7 @@ class YOLOSegBackend(LabelStudioMLBase):
                 project="/data/runs",
                 name=run_name,
                 exist_ok=False,
+                seed=random.randint(0, 2**31 - 1),
             )
             train_duration = time.monotonic() - train_start
 

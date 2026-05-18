@@ -115,7 +115,7 @@ def mask_to_yolo_polygons(mask: np.ndarray, min_area_px: int = 25) -> list[list[
 
 
 def export_annotations_to_yolo(
-    project_id: int, output_dir: Path, split: float = 0.8, seed: int = 42,
+    project_id: int, output_dir: Path, split: float = 0.8, seed: int | None = None,
     test_split: float = 0.0, max_images: int | None = None,
 ) -> tuple[list[str], int, int]:
     """Fetch annotated tasks from LS and write a YOLO segmentation dataset.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import xml.etree.ElementTree as ET
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,132 @@ from ls_cli.config import Settings
 from ls_cli.utils.output import console, error, info, success
 
 app = typer.Typer(help="Analyze dataset statistics.")
+
+
+class ExportFormat(str, Enum):
+    json = "JSON"
+    csv = "CSV"
+    tsv = "TSV"
+    coco = "COCO"
+    yolo = "YOLO"
+    brush_to_coco = "BRUSH_TO_COCO"
+
+
+@app.command()
+def export(
+    output: Path = typer.Argument(help="Output file, or directory when --with-images is set"),
+    format: ExportFormat = typer.Option(ExportFormat.json, "--format", "-f", help="Export format"),
+    with_images: bool = typer.Option(False, "--with-images", help="Download images to <output>/images/ (JSON format only)"),
+    project_id: Optional[int] = typer.Option(None, help="Project ID (auto-resolved if only one)"),
+    env_file: Optional[str] = typer.Option(None, help="Path to .env file"),
+) -> None:
+    """Export all annotated tasks from a Label Studio project to a file.
+
+    With --with-images the output becomes a directory containing
+    annotations.json and an images/ subfolder with all task images.
+    The annotations.json paths are rewritten to relative image paths.
+    """
+    if with_images and format != ExportFormat.json:
+        error("--with-images is only supported with --format json")
+        raise typer.Exit(1)
+
+    settings = Settings.load(env_file)
+    ls = get_client(settings)
+    pid = _resolve_project_id(ls, project_id)
+    base = settings.label_studio_url.rstrip("/")
+
+    default_extensions = {
+        ExportFormat.json: ".json",
+        ExportFormat.csv: ".csv",
+        ExportFormat.tsv: ".tsv",
+        ExportFormat.coco: ".json",
+        ExportFormat.yolo: ".zip",
+        ExportFormat.brush_to_coco: ".json",
+    }
+
+    info(f"Exporting project {pid} as {format.value}…")
+
+    try:
+        resp = requests.get(
+            f"{base}/api/projects/{pid}/export",
+            params={"exportType": format.value},
+            headers=auth_headers(ls),
+            timeout=300,
+            stream=True,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        error(f"Export failed: {exc}")
+        raise typer.Exit(1)
+
+    if not with_images:
+        out_path = output if output.suffix else output.with_suffix(default_extensions[format])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            dl_task = progress.add_task("Downloading…", total=None)
+            with out_path.open("wb") as fh:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    fh.write(chunk)
+            progress.update(dl_task, description="Done.")
+        size_kb = out_path.stat().st_size / 1024
+        success(f"Saved {size_kb:,.1f} KB → {out_path.resolve()}")
+        return
+
+    # --- with-images path ---
+    import base64
+
+    out_dir = output
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    annotations_path = out_dir / "annotations.json"
+
+    tasks = resp.json()
+    headers = auth_headers(ls)
+
+    failed = 0
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+        dl_task = progress.add_task(f"Downloading 0/{len(tasks)} images…", total=None)
+
+        for i, task in enumerate(tasks):
+            image_uri: str = task.get("data", {}).get("image", "")
+            if not image_uri:
+                continue
+
+            ext = Path(image_uri.split("?")[0]).suffix or ".jpg"
+            img_name = f"task_{task['id']:06d}{ext}"
+            img_dest = images_dir / img_name
+
+            try:
+                if image_uri.startswith(("s3://", "gs://", "azure://")):
+                    fileuri_b64 = base64.b64encode(image_uri.encode()).decode()
+                    img_resp = requests.get(
+                        f"{base}/tasks/{task['id']}/resolve/",
+                        params={"fileuri": fileuri_b64},
+                        headers=headers,
+                        timeout=60,
+                        allow_redirects=True,
+                    )
+                elif image_uri.startswith("/data/"):
+                    img_resp = requests.get(f"{base}{image_uri}", headers=headers, timeout=60)
+                else:
+                    img_resp = requests.get(image_uri, timeout=60)
+                img_resp.raise_for_status()
+                img_dest.write_bytes(img_resp.content)
+                task["data"]["image"] = f"images/{img_name}"
+            except Exception as exc:
+                error(f"  task {task['id']}: image download failed: {exc}")
+                failed += 1
+
+            progress.update(dl_task, description=f"Downloading {i + 1}/{len(tasks)} images…")
+
+        progress.update(dl_task, description="Done.")
+
+    annotations_path.write_text(json.dumps(tasks, indent=2))
+
+    total_images = len(tasks) - failed
+    success(f"Saved {total_images} images + annotations.json → {out_dir.resolve()}")
+    if failed:
+        info(f"  ({failed} image(s) failed to download)")
 
 
 def _resolve_project_id(ls, project_id: int | None) -> int:
